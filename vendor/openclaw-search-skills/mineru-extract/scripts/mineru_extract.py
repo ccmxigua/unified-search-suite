@@ -27,11 +27,35 @@ import json
 import os
 import pathlib
 import re
+import stat
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
+
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_JSON_BYTES = 8 * 1024 * 1024
+MAX_ZIP_MEMBERS = 5000
+MAX_ZIP_MEMBER_BYTES = 128 * 1024 * 1024
+MAX_ZIP_EXPANDED_BYTES = 512 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 500
+_REQUEST_DEADLINE = None
+
+
+def _set_request_deadline(deadline: float | None) -> None:
+    global _REQUEST_DEADLINE
+    _REQUEST_DEADLINE = deadline
+
+
+def _bounded_timeout(timeout: float) -> float:
+    if _REQUEST_DEADLINE is None:
+        return timeout
+    remaining = _REQUEST_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("MinerU request deadline exhausted")
+    return min(timeout, remaining)
 
 
 def _load_dotenv(path: pathlib.Path) -> None:
@@ -71,8 +95,10 @@ def _http_json(method: str, url: str, *, headers: dict[str, str] | None = None, 
 
     req = urllib.request.Request(url=url, data=data, method=method.upper(), headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+        with urllib.request.urlopen(req, timeout=_bounded_timeout(timeout)) as resp:
+            raw = resp.read(MAX_JSON_BYTES + 1)
+            if len(raw) > MAX_JSON_BYTES:
+                raise RuntimeError(f"JSON response exceeds {MAX_JSON_BYTES} bytes")
             return json.loads(raw.decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
         body = ""
@@ -91,8 +117,25 @@ def _http_bytes(url: str, *, headers: dict[str, str] | None = None, timeout: int
         hdrs.update(headers)
     req = urllib.request.Request(url=url, method="GET", headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+        with urllib.request.urlopen(req, timeout=_bounded_timeout(timeout)) as resp:
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError(f"MinerU archive exceeds {MAX_DOWNLOAD_BYTES} bytes")
+                except ValueError:
+                    pass
+            chunks = []
+            total = 0
+            while True:
+                chunk = resp.read(min(1024 * 1024, MAX_DOWNLOAD_BYTES + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError(f"MinerU archive exceeds {MAX_DOWNLOAD_BYTES} bytes")
+                chunks.append(chunk)
+            return b"".join(chunks)
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -103,6 +146,9 @@ def _http_bytes(url: str, *, headers: dict[str, str] | None = None, timeout: int
 
 
 def create_task(*, api_base: str, token: str, source_url: str, model_version: str, is_ocr: bool | None, enable_formula: bool | None, enable_table: bool | None, language: str | None, page_ranges: str | None, extra_formats: list[str] | None) -> str:
+    parsed_source = urllib.parse.urlsplit(source_url)
+    if parsed_source.scheme not in {"http", "https"} or not parsed_source.hostname or parsed_source.username or parsed_source.password:
+        raise ValueError("source must be an HTTP(S) URL with a hostname and no embedded credentials")
     endpoint = api_base.rstrip("/") + "/api/v4/extract/task"
     payload: dict = {"url": source_url, "model_version": model_version}
     if is_ocr is not None:
@@ -136,7 +182,7 @@ def create_task(*, api_base: str, token: str, source_url: str, model_version: st
 
 def poll_task(*, api_base: str, token: str, task_id: str, timeout_sec: int = 600, poll_interval: float = 2.0) -> dict:
     endpoint = api_base.rstrip("/") + f"/api/v4/extract/task/{task_id}"
-    start = time.time()
+    start = time.monotonic()
     last_state = None
     while True:
         res = _http_json("GET", endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=60)
@@ -154,16 +200,61 @@ def poll_task(*, api_base: str, token: str, task_id: str, timeout_sec: int = 600
             err = data.get("err_msg") or "(no err_msg)"
             raise RuntimeError(f"MinerU task failed: {err}")
 
-        if time.time() - start > timeout_sec:
+        if time.monotonic() - start > timeout_sec:
             raise RuntimeError(f"MinerU poll timeout after {timeout_sec}s (last state={state})")
-        time.sleep(poll_interval)
+        remaining = timeout_sec - (time.monotonic() - start)
+        if _REQUEST_DEADLINE is not None:
+            remaining = min(remaining, _REQUEST_DEADLINE - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("MinerU request deadline exhausted while polling")
+        time.sleep(min(poll_interval, remaining))
 
 
 def extract_markdown_from_zip(zip_bytes: bytes, out_dir: pathlib.Path) -> tuple[pathlib.Path | None, list[pathlib.Path]]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    root = out_dir.resolve()
     extracted: list[pathlib.Path] = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        z.extractall(out_dir)
+        members = z.infolist()
+        if len(members) > MAX_ZIP_MEMBERS:
+            raise ValueError(f"MinerU archive contains too many members ({len(members)})")
+        expanded_bytes = 0
+        for member in members:
+            relative = pathlib.PurePosixPath(member.filename)
+            if relative.is_absolute() or ".." in relative.parts or "\\" in member.filename:
+                raise ValueError(f"Unsafe path in MinerU archive: {member.filename!r}")
+            target = root.joinpath(*relative.parts).resolve()
+            if target != root and root not in target.parents:
+                raise ValueError(f"Unsafe path in MinerU archive: {member.filename!r}")
+            mode = member.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise ValueError(f"Symlink not allowed in MinerU archive: {member.filename!r}")
+            if member.file_size > MAX_ZIP_MEMBER_BYTES:
+                raise ValueError(f"MinerU archive member exceeds {MAX_ZIP_MEMBER_BYTES} bytes")
+            expanded_bytes += member.file_size
+            if expanded_bytes > MAX_ZIP_EXPANDED_BYTES:
+                raise ValueError(f"MinerU archive expands beyond {MAX_ZIP_EXPANDED_BYTES} bytes")
+            if member.file_size and (
+                member.compress_size == 0 or
+                member.file_size / member.compress_size > MAX_ZIP_COMPRESSION_RATIO
+            ):
+                raise ValueError(f"Suspicious compression ratio in MinerU archive member: {member.filename!r}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            written = 0
+            with z.open(member) as source, target.open("wb") as destination:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > member.file_size or written > MAX_ZIP_MEMBER_BYTES:
+                        raise ValueError(f"Invalid expanded size for MinerU archive member: {member.filename!r}")
+                    destination.write(chunk)
+            if written != member.file_size:
+                raise ValueError(f"Truncated MinerU archive member: {member.filename!r}")
 
     for p in out_dir.rglob("*"):
         if p.is_file():
@@ -214,6 +305,9 @@ def main() -> int:
     ap.add_argument("--max-chars", type=int, default=12000, help="When --print, max chars to print.")
 
     args = ap.parse_args()
+    if args.timeout <= 0:
+        ap.error("--timeout must be a positive number")
+    _set_request_deadline(time.monotonic() + args.timeout)
 
     token = os.environ.get("MINERU_TOKEN")
     if not token:
@@ -222,7 +316,7 @@ def main() -> int:
 
     model_version = args.model_version
     if not model_version:
-        lower = args.source.lower()
+        lower = urllib.parse.urlsplit(args.source).path.lower()
         if lower.endswith((".pdf", ".doc", ".docx", ".ppt", ".pptx", ".png", ".jpg", ".jpeg")):
             model_version = "pipeline"
         else:
@@ -249,6 +343,9 @@ def main() -> int:
     full_zip_url = data.get("full_zip_url")
     if not full_zip_url:
         raise RuntimeError(f"No full_zip_url in done task: {data}")
+    parsed_zip_url = urllib.parse.urlsplit(full_zip_url)
+    if parsed_zip_url.scheme not in {"http", "https"} or not parsed_zip_url.hostname or parsed_zip_url.username or parsed_zip_url.password:
+        raise ValueError("MinerU returned an invalid archive URL")
 
     zip_bytes = _http_bytes(full_zip_url, timeout=180)
 
@@ -258,7 +355,7 @@ def main() -> int:
     zip_path = base_out / "result.zip"
     zip_path.write_bytes(zip_bytes)
 
-    md_path, extracted = extract_markdown_from_zip(zip_bytes, base_out)
+    md_path, extracted = extract_markdown_from_zip(zip_bytes, base_out / "extracted")
 
     summary = {
         "task_id": task_id,

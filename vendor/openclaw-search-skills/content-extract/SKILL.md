@@ -74,6 +74,8 @@ python3 mineru-extract/scripts/mineru_parse_documents.py \
 
 > **路径说明**: 上述命令假设你在 skills 安装根目录下执行。如果 mineru-extract 安装在其他位置，请替换为实际路径。
 
+`--timeout` controls the MinerU request budget (default 600 seconds); the wrapper gives the child process a 15-second cleanup margin and returns a structured error if it expires. MinerU downloads and ZIP extraction use the same size, member-count, expansion, and path-safety limits documented by `mineru-extract`.
+
 ## 交付规范（强制）
 
 - 输出必须包含 `sources`（原文入口 + 解析产物入口）。

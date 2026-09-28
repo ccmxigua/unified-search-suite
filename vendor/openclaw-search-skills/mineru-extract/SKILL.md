@@ -83,6 +83,8 @@ It prints a JSON summary to **stderr** with paths:
 - `--page-ranges "2,4-6"` (non-HTML)
 - `--timeout 600` / `--poll-interval 2`
 
+The request timeout is a single deadline for API requests, polling, and result download. Downloads are limited to 100 MiB; extracted archives are limited to 5,000 members, 128 MiB per member, 512 MiB expanded total, and a 500:1 compression ratio. ZIP paths are validated and symbolic links are rejected before extraction. The wrapper returns an item-level error if a URL, download, archive, or deadline violates these limits.
+
 ## Failure modes & fallbacks
 
 - MinerU may fail to fetch some URLs (anti-bot / geo / login).

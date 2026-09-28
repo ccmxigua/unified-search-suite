@@ -1,6 +1,6 @@
 ---
 name: unified-search
-description: Unified web search + deep research suite. Default ordinary /unified_search queries route to deep search-layer mode (Exa + Tavily + Grok); the legacy merged three-engine search (Tavily + Exa + Google) remains available via --legacy or the legacy subcommand. Use when user asks for “综合搜索”, “三搜索”, “三引擎”, “/unified_search”, deep search, issue/PR thread tracing, content extraction, or URL→Markdown conversion.
+description: Unified web search + deep research suite. Default ordinary /unified_search queries route to deep search-layer mode. The legacy merged three-engine script is not included in this repository snapshot, so --legacy requires that script to be supplied separately. Use when user asks for “综合搜索”, “三搜索”, “三引擎”, “/unified_search”, deep search, issue/PR thread tracing, content extraction, or URL→Markdown conversion.
 ---
 
 # Unified Search
@@ -10,9 +10,9 @@ This skill is now a **two-layer search suite**:
 1. **Vendored deep-research stack** — now the default for ordinary `/unified_search <query>` calls
    - `search-layer`: Exa + Tavily + Grok multi-source search with intent-aware scoring
    - `fetch-thread`: deep thread / issue / PR / forum context extraction
-   - `content-extract`: URL → Markdown with MinerU fallback
+   - `content-extract`: local URL → Markdown extraction (MinerU is a separate explicit route)
    - `mineru-extract`: official MinerU parsing wrapper
-2. **Legacy merged search** — available via `--legacy` or the explicit `legacy` subcommand
+2. **Legacy merged search** — compatibility route via `--legacy` or the explicit `legacy` subcommand, provided `scripts/unified-search-legacy.sh` is installed
    - Engines: **Tavily + Exa + Google**
    - Best for: quick fact-checks, troubleshooting, product/doc lookup, fast aggregated evidence
 
@@ -26,20 +26,18 @@ Run:
 bash scripts/unified-search.sh "<query>"
 ```
 
-This routes ordinary lookup queries to `search-layer` deep mode by default. Use `--legacy` or the `legacy` subcommand when the old Tavily + Exa + Google merged output is specifically needed.
+This routes ordinary lookup queries to `search-layer` deep mode by default. In this repository snapshot, the legacy script is absent; `--legacy` and `legacy` return an explicit missing-implementation error until that script is supplied.
 
 Examples:
 
 ```bash
 bash scripts/unified-search.sh "tavily language filter"
 bash scripts/unified-search.sh "OpenClaw cron run docs"
-bash scripts/unified-search.sh --legacy "OpenClaw cron run docs" --topic news --days 7
 ```
 
 Chat trigger examples:
 - `/unified_search tavily docs language filter`
 - `/unified_search OpenClaw cron run docs`
-- `/unified_search --legacy OpenClaw cron run docs --topic news --days 7`
 
 ### B. Explicit deep research: route to vendored search-layer
 
@@ -71,7 +69,7 @@ Examples:
 
 ```bash
 bash scripts/unified-search.sh fetch-thread "https://github.com/owner/repo/issues/123" --format markdown
-bash scripts/unified-search.sh fetch-thread "https://news.ycombinator.com/item?id=43197966"
+bash scripts/unified-search.sh fetch-thread "https://news.ycombinator.com/item?id=43197966" --timeout 60
 ```
 
 ### D. URL → Markdown extraction
@@ -91,6 +89,15 @@ bash scripts/unified-search.sh mineru-extract "https://example.com/file.pdf"
 bash scripts/unified-search.sh mineru-parse-documents --file-sources "https://example.com/file.pdf"
 ```
 
+## Request and content limits
+
+- Search-layer requests have a 105-second default deadline. Set `UNIFIED_SEARCH_TIMEOUT_SECONDS` or pass `--timeout` to use a different positive budget; the MCP wrapper's outer timeout remains 120 seconds by default.
+- `fetch-thread` accepts only HTTP(S) URLs, blocks localhost and non-public literal IP addresses (including on redirects), caps API responses at 10 MiB and generic HTML at 5 MiB, and limits fetched comments to 500 (HN comment trees to 200). Its CLI `--timeout` sets one request deadline. Results include `truncated` and `truncation_reasons` when a known limit or incomplete page affects returned content. Hostname DNS answers are not pinned, so this is not a complete DNS-rebinding/SSRF boundary.
+- Search JSON reports source/query outcomes through `status`, `provider_status`, `provider_errors`, and optional `query_errors`. Reference extraction adds `refs_status`; an item-level fetch error or truncation changes the overall status to `partial` (or `error` when every explicit-URL extraction fails).
+- The standalone relevance gate fails closed when the scorer is unavailable or returns malformed/incomplete scores; it emits a structured failure object and non-zero exit status in those cases.
+- MinerU downloads are capped at 100 MiB. ZIP extraction is bounded to 5,000 members, 128 MiB per member, 512 MiB expanded total, and a 500:1 compression ratio; unsafe paths and symlinks are rejected. Request deadlines also bound polling and network calls.
+- `content-extract --timeout` bounds the MinerU child process (default 600 seconds); the wrapper allows 15 seconds of process-cleanup margin.
+
 ## Wrapper subcommands
 
 ### 1) Default deep search-layer
@@ -99,13 +106,9 @@ bash scripts/unified-search.sh mineru-parse-documents --file-sources "https://ex
 bash scripts/unified-search.sh "<query>"
 ```
 
-Ordinary queries now default to search-layer deep mode. Legacy parameters are only for `--legacy` or the explicit `legacy` subcommand:
-- `--num`: max results per engine (default `5`)
-- `--topic`: `general` or `news` (default `general`)
-- `--days`: only for recent-news style queries
-- `--save-run`: save output to custom dir
-- `--json`: emit `summary.json`
-- `--legacy`: force old Tavily + Exa + Google merged behavior
+Ordinary queries now default to search-layer deep mode. Use the explicit `search-layer` subcommand for search-layer options such as `--num`, `--mode`, and `--intent`. `--save-run DIR` applies to wrapper routes and uses a unique filename if multiple runs start in the same second. `--topic`, `--days`, and `--json` select the legacy interface, which currently returns a missing-implementation error because its script is absent.
+
+Chinese query expansion and optional English-to-Chinese result summaries use Google Translate by default. Set `UNIFIED_SEARCH_DISABLE_TRANSLATION=1` to keep both the query and result text local to the configured search providers.
 
 ### 2) search-layer
 
@@ -144,10 +147,8 @@ bash scripts/unified-search.sh mineru-parse-documents --file-sources "<URL1>\n<U
 
 ## Environment / dependency notes
 
-### Existing legacy search
-- Tavily key: usually from `~/.openclaw/openclaw.json -> skills.entries.tavily.apiKey`
-- Exa key: existing local setup / env override
-- Google leg: depends on installed `google-search` skill
+### Legacy search route (not bundled)
+This repository snapshot has no `scripts/unified-search-legacy.sh`, so its legacy engine setup cannot be run from this checkout.
 
 ### Vendored deep-search stack
 Preferred credentials file:
@@ -189,24 +190,22 @@ export MINERU_TOKEN="..."   # required for MinerU parsing
 ```
 
 ### Local Python runtime
-This skill now uses a dedicated venv:
+This skill uses a dedicated venv. For a local checkout, create it and install the packages in `requirements.txt` with:
 
 ```bash
-.venv（local virtualenv, create with: python3 -m venv .venv）
+bash scripts/setup-venv.sh
 ```
 
-Installed there:
-- `requests`
-- `trafilatura`
-- `beautifulsoup4`
-- `lxml`
+The setup script requires Python 3.10 or newer. It installs the content extraction, search, and MCP server dependencies into `.venv`.
 
 ## Important constraints
 
 - The vendored `search-layer` script can directly use **Exa + Tavily + Grok + TinyFish**.
 - The original upstream README also references **Brave via OpenClaw built-in `web_search`**, but shell scripts themselves cannot call agent-only tools. So in pure CLI mode, Brave is not auto-executed by the wrapper.
-- Your original **Google-backed merged search** is preserved as the day-to-day aggregated search path.
-- `content-extract` and `mineru-*` require external accessibility and, for MinerU, a valid `MINERU_TOKEN`.
+- The current default query route is the vendored deep `search-layer`; there is no bundled Google-backed legacy implementation in this snapshot.
+- If no configured provider matches the selected mode/source filter, `search-layer` emits a JSON `no_search_provider` error and exits non-zero instead of returning an indistinguishable successful empty result.
+- `content-extract` performs local extraction with its Python dependencies; it does not currently fall back to MinerU. `mineru-*` routes require external accessibility and a valid `MINERU_TOKEN`.
+- The MCP wrapper defaults to a 120-second timeout. Set `UNIFIED_SEARCH_MCP_TIMEOUT_SECONDS` to a positive number to change that limit; timeouts and non-zero exits return JSON containing status and captured output. Successful runs preserve stderr diagnostics separately; only explicit provider failures mark the result `partial`.
 
 ## Vendored source snapshot
 
@@ -223,7 +222,7 @@ Key vendored modules:
 
 ## Output pattern
 
-### Legacy merged search
+### Legacy merged search (when the implementation is supplied)
 1. Keep raw engine blocks (Tavily / Exa / Google)
 2. Deduplicate overlapping links
 3. Report:

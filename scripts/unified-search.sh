@@ -1,7 +1,8 @@
 #!/bin/bash
 # unified-search.sh — unified entrypoint for legacy merged search + vendored deep search suite
 #
-# Default: preserve legacy merged three-engine search (Tavily + Exa + Google)
+# Default text queries use the deep search-layer route. The explicit legacy
+# route is retained as a compatibility entrypoint when its script is installed.
 # New subcommands:
 #   search-layer            -> vendored multi-source deep search
 #   fetch-thread            -> vendored issue/PR/thread fetcher
@@ -14,7 +15,7 @@
 #   - Document URLs (.pdf/.docx/...) -> mineru-extract
 #   - Generic URLs -> content-extract
 #   - Comparison / status / research style natural-language queries -> search-layer
-#   - Plain everyday lookup -> legacy merged search
+#   - Plain text query -> search-layer deep search
 
 set -euo pipefail
 
@@ -30,7 +31,7 @@ MINERU_PARSE_DOCS_WRAPPER="$SCRIPT_DIR/run-mineru-parse-documents.sh"
 usage() {
   cat <<'EOF'
 Usage:
-  bash unified-search.sh "<query>" [legacy flags]
+  bash unified-search.sh "<query>" [search-layer flags]
   bash unified-search.sh --deep "<query>" [deep-search flags]
   bash unified-search.sh search-layer <args...>
   bash unified-search.sh fetch-thread <url> [args...]
@@ -38,22 +39,24 @@ Usage:
   bash unified-search.sh mineru-extract <url> [args...]
   bash unified-search.sh mineru-parse-documents <args...>
 
-Legacy flags:
-  --num N --topic general|news --days N --save-run DIR --json --legacy
+Wrapper option:
+  --save-run DIR
 
-Deep-search flags:
+Search-layer flags (use the search-layer subcommand for the full option set):
   --deep   (alias of --mode deep)
   --fast   (alias of --mode fast)
   --answer (alias of --mode answer)
-  --mode --intent --freshness --queries --source --extract-refs --extract-refs-urls --domain-boost
-  --save-run DIR (save stdout to DIR/<mode>-<timestamp>.json for all modes)
+  --mode --intent --freshness --queries --source --num --timeout --extract-refs --extract-refs-urls --domain-boost
+
+Legacy compatibility options (require scripts/unified-search-legacy.sh, not bundled here):
+  --topic general|news --days N --json --legacy
 
 Automatic routing:
   - discussion/thread URLs             -> fetch-thread
   - document/file URLs                 -> mineru-extract
   - generic content URLs               -> content-extract
   - comparison/status/research queries -> search-layer
-  - ordinary lookups                   -> legacy merged search
+  - ordinary text queries              -> search-layer deep search
 EOF
 }
 
@@ -141,9 +144,29 @@ is_document_url() {
 
 query_text() {
   local joined=""
+  local skip_value=false
+  local literal=false
   local arg
   for arg in "$@"; do
-    [[ "$arg" == --* ]] && continue
+    if $literal; then
+      joined+="$arg "
+      continue
+    fi
+    if [[ "$arg" == "--" ]]; then
+      literal=true
+      continue
+    fi
+    if $skip_value; then
+      skip_value=false
+      continue
+    fi
+    case "$arg" in
+      --num|--timeout|--topic|--days|--mode|--intent|--freshness|--source|--domain-boost|--extract-refs-urls)
+        skip_value=true
+        continue
+        ;;
+      --*) continue ;;
+    esac
     joined+="$arg "
   done
   printf '%s' "${joined% }"
@@ -151,6 +174,10 @@ query_text() {
 
 expand_query_variants() {
   local query="$1"
+  if [[ "${UNIFIED_SEARCH_DISABLE_TRANSLATION:-0}" =~ ^(1|true|yes)$ ]]; then
+    printf '%s\n' "$query"
+    return 0
+  fi
   python3 - "$query" <<'PY'
 import json
 import re
@@ -279,6 +306,10 @@ FILTERED=()
 SKIP_SAVE=false
 for arg in "$@"; do
   if $SKIP_SAVE; then
+    if [[ -z "$arg" ]]; then
+      echo "[ERROR] --save-run requires a non-empty directory argument" >&2
+      exit 2
+    fi
     SAVE_RUN_DIR="$arg"
     SKIP_SAVE=false
     continue
@@ -289,7 +320,24 @@ for arg in "$@"; do
   fi
   FILTERED+=("$arg")
 done
+if $SKIP_SAVE; then
+  echo "[ERROR] --save-run requires a directory argument" >&2
+  exit 2
+fi
 set -- "${FILTERED[@]}"
+
+# Reject unknown long options before automatic routing can silently discard
+# the option name and accidentally turn its value into part of the query.
+for arg in "$@"; do
+  [[ "$arg" == "--" ]] && break
+  case "$arg" in
+    --legacy|--json|--deep|--fast|--answer|--mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--topic|--days|--mode=*|--intent=*|--freshness=*|--queries=*|--source=*|--domain-boost=*|--num=*|--timeout=*|--topic=*|--days=*) ;;
+    --*)
+      echo "[ERROR] Unknown option: $arg (use -- before literal query text beginning with --)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Fallback to env var if --save-run not explicitly passed on command line
 if [[ -z "$SAVE_RUN_DIR" && -n "${UNIFIED_SEARCH_SAVE_DIR:-}" ]]; then
@@ -307,13 +355,26 @@ fi
 run_with_save() {
   local wrapper="$1"
   shift
+  if [[ ! -f "$wrapper" ]]; then
+    echo "[ERROR] Search route is unavailable; missing implementation: $wrapper" >&2
+    return 127
+  fi
   if [[ -n "$SAVE_RUN_DIR" ]]; then
     mkdir -p "$SAVE_RUN_DIR"
-    local ts mode
+    local ts mode run_file suffix
     ts="$(date +%Y%m%dT%H%M%S)"
     mode="$(basename "$wrapper" .sh | sed 's/^run-//;s/^unified-search-legacy$/legacy/')"
-    echo "[save-run] $mode → $SAVE_RUN_DIR/${mode}-${ts}.json" >&2
-    bash "$wrapper" "$@" | tee "$SAVE_RUN_DIR/${mode}-${ts}.json"
+    run_file="$SAVE_RUN_DIR/${mode}-${ts}.json"
+    suffix=0
+    while :; do
+      if (set -o noclobber; : > "$run_file") 2>/dev/null; then
+        break
+      fi
+      suffix=$((suffix + 1))
+      run_file="$SAVE_RUN_DIR/${mode}-${ts}-${suffix}.json"
+    done
+    echo "[save-run] $mode → $run_file" >&2
+    bash "$wrapper" "$@" | tee "$run_file"
     exit "${PIPESTATUS[0]}"
   else
     exec bash "$wrapper" "$@"
@@ -354,12 +415,15 @@ force_legacy=0
 if has_arg --legacy "$@"; then
   force_legacy=1
 fi
+if has_arg --topic "$@" || has_arg --days "$@" || has_arg --json "$@"; then
+  force_legacy=1
+fi
 
 if [[ "$force_legacy" == "0" ]]; then
   local_like_flags=0
   for arg in "$@"; do
     case "$arg" in
-      --mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost)
+      --mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--mode=*|--intent=*|--freshness=*|--source=*|--num=*|--timeout=*|--domain-boost=*)
         local_like_flags=1
         ;;
     esac

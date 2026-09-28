@@ -27,9 +27,11 @@ import json
 import os
 import pathlib
 import re
+import stat
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -43,6 +45,27 @@ def _default_workspace() -> pathlib.Path:
 
 WORKSPACE = _default_workspace()
 CACHE_ROOT = WORKSPACE / "mineru-cache"
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_JSON_BYTES = 8 * 1024 * 1024
+MAX_ZIP_MEMBERS = 5000
+MAX_ZIP_MEMBER_BYTES = 128 * 1024 * 1024
+MAX_ZIP_EXPANDED_BYTES = 512 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 500
+_REQUEST_DEADLINE = None
+
+
+def _set_request_deadline(deadline: float | None) -> None:
+    global _REQUEST_DEADLINE
+    _REQUEST_DEADLINE = deadline
+
+
+def _bounded_timeout(timeout: float) -> float:
+    if _REQUEST_DEADLINE is None:
+        return timeout
+    remaining = _REQUEST_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("MinerU request deadline exhausted")
+    return min(timeout, remaining)
 
 
 def _load_dotenv(path: pathlib.Path) -> None:
@@ -76,8 +99,10 @@ def _http_json(method: str, url: str, *, headers: dict[str, str] | None = None, 
 
     req = urllib.request.Request(url=url, data=data, method=method.upper(), headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+        with urllib.request.urlopen(req, timeout=_bounded_timeout(timeout)) as resp:
+            raw = resp.read(MAX_JSON_BYTES + 1)
+            if len(raw) > MAX_JSON_BYTES:
+                raise RuntimeError(f"JSON response exceeds {MAX_JSON_BYTES} bytes")
             return json.loads(raw.decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
         body = ""
@@ -96,8 +121,25 @@ def _http_bytes(url: str, *, headers: dict[str, str] | None = None, timeout: int
         hdrs.update(headers)
     req = urllib.request.Request(url=url, method="GET", headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+        with urllib.request.urlopen(req, timeout=_bounded_timeout(timeout)) as resp:
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError(f"MinerU archive exceeds {MAX_DOWNLOAD_BYTES} bytes")
+                except ValueError:
+                    pass
+            chunks = []
+            total = 0
+            while True:
+                chunk = resp.read(min(1024 * 1024, MAX_DOWNLOAD_BYTES + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError(f"MinerU archive exceeds {MAX_DOWNLOAD_BYTES} bytes")
+                chunks.append(chunk)
+            return b"".join(chunks)
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -108,7 +150,11 @@ def _http_bytes(url: str, *, headers: dict[str, str] | None = None, timeout: int
 
 
 def _is_url(s: str) -> bool:
-    return s.startswith("http://") or s.startswith("https://")
+    try:
+        parsed = urllib.parse.urlsplit(s)
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname) and not parsed.username and not parsed.password
+    except ValueError:
+        return False
 
 
 def _split_sources(s: str) -> list[str]:
@@ -153,7 +199,7 @@ def create_task(*, api_base: str, token: str, payload: dict) -> str:
 
 def poll_task(*, api_base: str, token: str, task_id: str, timeout_sec: int, poll_interval: float) -> dict:
     endpoint = api_base.rstrip("/") + f"/api/v4/extract/task/{task_id}"
-    start = time.time()
+    start = time.monotonic()
     last_state = None
     while True:
         res = _http_json("GET", endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=60)
@@ -168,15 +214,60 @@ def poll_task(*, api_base: str, token: str, task_id: str, timeout_sec: int, poll
             return data
         if state == "failed":
             raise RuntimeError(f"MinerU task failed: {data.get('err_msg') or '(no err_msg)'}")
-        if time.time() - start > timeout_sec:
+        elapsed = time.monotonic() - start
+        if elapsed > timeout_sec:
             raise RuntimeError(f"MinerU poll timeout after {timeout_sec}s (last state={state})")
-        time.sleep(poll_interval)
+        remaining = timeout_sec - elapsed
+        if _REQUEST_DEADLINE is not None:
+            remaining = min(remaining, _REQUEST_DEADLINE - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("MinerU request deadline exhausted while polling")
+        time.sleep(min(poll_interval, remaining))
 
 
 def extract_main_markdown(zip_bytes: bytes, out_dir: pathlib.Path) -> pathlib.Path | None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    root = out_dir.resolve()
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        z.extractall(out_dir)
+        members = z.infolist()
+        if len(members) > MAX_ZIP_MEMBERS:
+            raise ValueError(f"MinerU archive contains too many members ({len(members)})")
+        expanded_bytes = 0
+        for member in members:
+            relative = pathlib.PurePosixPath(member.filename)
+            if relative.is_absolute() or ".." in relative.parts or "\\" in member.filename:
+                raise ValueError(f"Unsafe path in MinerU archive: {member.filename!r}")
+            target = root.joinpath(*relative.parts).resolve()
+            if target != root and root not in target.parents:
+                raise ValueError(f"Unsafe path in MinerU archive: {member.filename!r}")
+            if stat.S_ISLNK(member.external_attr >> 16):
+                raise ValueError(f"Symlink not allowed in MinerU archive: {member.filename!r}")
+            if member.file_size > MAX_ZIP_MEMBER_BYTES:
+                raise ValueError(f"MinerU archive member exceeds {MAX_ZIP_MEMBER_BYTES} bytes")
+            expanded_bytes += member.file_size
+            if expanded_bytes > MAX_ZIP_EXPANDED_BYTES:
+                raise ValueError(f"MinerU archive expands beyond {MAX_ZIP_EXPANDED_BYTES} bytes")
+            if member.file_size and (
+                member.compress_size == 0 or
+                member.file_size / member.compress_size > MAX_ZIP_COMPRESSION_RATIO
+            ):
+                raise ValueError(f"Suspicious compression ratio in MinerU archive member: {member.filename!r}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            written = 0
+            with z.open(member) as source, target.open("wb") as destination:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > member.file_size or written > MAX_ZIP_MEMBER_BYTES:
+                        raise ValueError(f"Invalid expanded size for MinerU archive member: {member.filename!r}")
+                    destination.write(chunk)
+            if written != member.file_size:
+                raise ValueError(f"Truncated MinerU archive member: {member.filename!r}")
 
     md_files = [p for p in out_dir.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".markdown")]
     if not md_files:
@@ -195,7 +286,61 @@ def extract_main_markdown(zip_bytes: bytes, out_dir: pathlib.Path) -> pathlib.Pa
     return md_files_sorted[0]
 
 
+def _cache_file(meta: dict, field: str, out_dir: pathlib.Path, *, suffixes: tuple[str, ...] = ()) -> pathlib.Path | None:
+    raw_path = meta.get(field)
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    root = out_dir.resolve()
+    path = pathlib.Path(raw_path)
+    if not path.is_absolute():
+        path = root / path
+    try:
+        path = path.resolve(strict=True)
+    except OSError:
+        return None
+    if root not in path.parents or not path.is_file() or path.stat().st_size <= 0:
+        return None
+    if suffixes and path.suffix.lower() not in suffixes:
+        return None
+    return path
+
+
+def _file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _valid_cache(meta: dict, *, key: str, source_url: str, model_version: str, out_dir: pathlib.Path) -> bool:
+    if meta.get("cache_key") != key or meta.get("source") != source_url:
+        return False
+    if meta.get("model_version") != model_version:
+        return False
+    markdown_path = _cache_file(meta, "markdown_path", out_dir, suffixes=(".md", ".markdown"))
+    zip_path = _cache_file(meta, "zip_path", out_dir, suffixes=(".zip",))
+    if not markdown_path or not zip_path:
+        return False
+    try:
+        if meta.get("markdown_sha256") and _file_sha256(markdown_path) != meta["markdown_sha256"]:
+            return False
+        if meta.get("zip_sha256") and _file_sha256(zip_path) != meta["zip_sha256"]:
+            return False
+        with zipfile.ZipFile(zip_path) as z:
+            if z.testzip() is not None:
+                return False
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return True
+
+
 def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: bool, language: str, page_ranges: str | None, model_version: str | None, enable_table: bool | None, enable_formula: bool | None, extra_formats: list[str] | None, timeout_sec: int, poll_interval: float, cache: bool, force: bool) -> dict:
+    if timeout_sec <= 0:
+        raise ValueError("timeout_sec must be positive")
+    if not _is_url(source_url):
+        raise ValueError("source must be an HTTP(S) URL with a hostname and no embedded credentials")
+    _set_request_deadline(time.monotonic() + timeout_sec)
     mv = _pick_model_version(source_url, model_version)
 
     payload: dict = {
@@ -220,8 +365,13 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
     if cache and (not force) and meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            md_path = pathlib.Path(meta.get("markdown_path") or "")
-            if md_path and md_path.exists():
+            if isinstance(meta, dict) and _valid_cache(
+                meta,
+                key=key,
+                source_url=source_url,
+                model_version=mv,
+                out_dir=out_dir,
+            ):
                 meta["cached"] = True
                 return meta
         except Exception:
@@ -234,11 +384,15 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
     full_zip_url = data.get("full_zip_url")
     if not full_zip_url:
         raise RuntimeError(f"No full_zip_url in done task: {data}")
+    if not _is_url(full_zip_url):
+        raise ValueError("MinerU returned an invalid archive URL")
     zip_bytes = _http_bytes(full_zip_url, timeout=180)
     zip_path = out_dir / f"{_sanitize(task_id)}.zip"
     zip_path.write_bytes(zip_bytes)
 
-    md_path = extract_main_markdown(zip_bytes, out_dir)
+    md_path = extract_main_markdown(zip_bytes, out_dir / f"extract-{_sanitize(task_id)}")
+    if not md_path or not md_path.is_file() or md_path.stat().st_size <= 0:
+        raise RuntimeError("MinerU result archive contains no non-empty Markdown file")
 
     result = {
         "ok": True,
@@ -255,6 +409,10 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
         "markdown_path": str(md_path) if md_path else None,
         "cached": False,
         "cache_key": key,
+        "zip_size": zip_path.stat().st_size,
+        "zip_sha256": _file_sha256(zip_path),
+        "markdown_size": md_path.stat().st_size,
+        "markdown_sha256": _file_sha256(md_path),
         "fetched_at": int(time.time()),
     }
     meta_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -281,6 +439,8 @@ def main() -> int:
     ap.add_argument("--max-chars", type=int, default=20000, help="When --emit-markdown, truncate markdown to this many chars.")
 
     args = ap.parse_args()
+    if args.timeout <= 0 or args.poll_interval <= 0:
+        ap.error("--timeout and --poll-interval must be positive")
 
     token = os.environ.get("MINERU_TOKEN")
     if not token:

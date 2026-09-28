@@ -68,8 +68,11 @@ def main() -> int:
     ap.add_argument("--language", default="ch")
     ap.add_argument("--emit-markdown", action="store_true", default=True)
     ap.add_argument("--max-chars", type=int, default=20000)
+    ap.add_argument("--timeout", type=int, default=600, help="MinerU request budget in seconds")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
+    if args.timeout <= 0:
+        ap.error("--timeout must be positive")
 
     try:
         wrapper = _find_mineru_wrapper()
@@ -90,11 +93,18 @@ def main() -> int:
         "--emit-markdown",
         "--max-chars",
         str(args.max_chars),
+        "--timeout",
+        str(args.timeout),
     ]
     if args.force:
         cmd.append("--force")
 
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout + 15)
+    except subprocess.TimeoutExpired as e:
+        out = _error_output(args.url, [f"MinerU extraction exceeded {args.timeout} seconds", str(e.stderr or "")[:300]])
+        sys.stdout.write(json.dumps(out, ensure_ascii=False))
+        return 2
 
     try:
         j = json.loads(p.stdout)

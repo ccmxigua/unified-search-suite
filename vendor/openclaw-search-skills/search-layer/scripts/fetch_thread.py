@@ -27,10 +27,76 @@ import sys
 import os
 import re
 import argparse
+import ipaddress
+import math
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.error import HTTPError, URLError
 from datetime import datetime, timezone
+import time
+
+_REQUEST_DEADLINE = None
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+MAX_WEB_BODY_BYTES = 5 * 1024 * 1024
+MAX_COMMENTS = 500
+
+
+def _validate_http_url(url: str) -> None:
+    """Reject non-web schemes and obvious local-network targets."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("URL must use http or https and include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing embedded credentials are not allowed")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        raise ValueError("local hostnames are not allowed")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise ValueError("non-public IP addresses are not allowed")
+
+
+class _ValidatedRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _safe_urlopen(req: Request, timeout: float):
+    _validate_http_url(req.full_url)
+    return build_opener(_ValidatedRedirectHandler()).open(req, timeout=timeout)
+
+
+def set_request_deadline(deadline):
+    global _REQUEST_DEADLINE
+    _REQUEST_DEADLINE = deadline
+
+
+def _bounded_timeout(timeout):
+    if _REQUEST_DEADLINE is None:
+        return timeout
+    remaining = _REQUEST_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exhausted")
+    return min(timeout, remaining)
+
+
+def _mark_truncated(result: dict, reason: str) -> None:
+    result["truncated"] = True
+    reasons = result.setdefault("truncation_reasons", [])
+    if reason not in reasons:
+        reasons.append(reason)
+
+
+def _iter_nested_comments(nodes: list):
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        yield node
+        yield from _iter_nested_comments(node.get("replies", []))
 
 
 # ---------------------------------------------------------------------------
@@ -44,18 +110,27 @@ def _http_get(url: str, headers: dict | None = None,
         from urllib.parse import urlencode
         sep = "&" if "?" in url else "?"
         url = url + sep + urlencode(params)
+    _validate_http_url(url)
     req = Request(url, method="GET")
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+        with _safe_urlopen(req, timeout=_bounded_timeout(timeout)) as resp:
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise ValueError(f"HTTP response exceeds {MAX_RESPONSE_BYTES} bytes")
+            body = raw.decode("utf-8", errors="replace")
             status = resp.status
+        error_body_truncated = False
     except HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        raw = e.read(MAX_RESPONSE_BYTES + 1) if e.fp else b""
+        error_body_truncated = len(raw) > MAX_RESPONSE_BYTES
+        body = raw[:MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
         status = e.code
     result = {"status": status, "text": body}
+    if error_body_truncated:
+        result["truncated"] = True
     try:
         result["json"] = json.loads(body)
     except (json.JSONDecodeError, ValueError):
@@ -118,7 +193,7 @@ _REF_PATTERNS = [
     # "See also", "Related", "Fixes", "Closes" references
     (r'(?i)(?:see\s+also|related(?:\s+to)?|fixes|closes|resolves|refs?)\s+#(\d+)', 'related_ref'),
     # Generic URLs (non-GitHub)
-    (r'(?<!\S)(https?://(?!github\.com)[^\s<>\[\]()]+?)(?=[)\s.,;:!?\'\"]|$)', 'external_url'),
+    (r'(?<!\S)(https?://(?!github\.com)[^\s<>\[\]()\'\"]+)', 'external_url'),
 ]
 
 
@@ -136,12 +211,13 @@ def extract_refs(text: str, repo_context: str = "") -> list:
         return []
 
     refs = []
-    seen_urls = set()
+    seen_refs = set()
 
     def _add(ref_type: str, url: str, context: str = ""):
         canon = url.rstrip("/")
-        if canon not in seen_urls:
-            seen_urls.add(canon)
+        identity = (canon, ref_type)
+        if identity not in seen_refs:
+            seen_refs.add(identity)
             refs.append({"type": ref_type, "url": url, "context": context})
 
     for pattern, kind in _REF_PATTERNS:
@@ -205,7 +281,7 @@ def extract_refs(text: str, repo_context: str = "") -> list:
                     _add("related", url, ctx)
 
             elif kind == 'external_url':
-                url = m.group(1)
+                url = m.group(1).rstrip(".,;:!?")
                 # Skip image URLs and common non-reference URLs
                 if not re.search(r'\.(png|jpg|jpeg|gif|svg|ico|webp)(\?|$)', url, re.I):
                     _add("url", url, ctx)
@@ -241,6 +317,7 @@ def _parse_github_url(url: str) -> dict | None:
 def fetch_github_issue(owner: str, repo: str, number: int,
                        token: str | None, max_comments: int = 100) -> dict:
     """Fetch a GitHub issue with all comments via REST API."""
+    max_comments = max(1, min(MAX_COMMENTS, int(max_comments)))
     base = f"https://api.github.com/repos/{owner}/{repo}"
     headers = _gh_headers(token)
     result = {
@@ -261,6 +338,8 @@ def fetch_github_issue(owner: str, repo: str, number: int,
         r = _http_get(f"{base}/issues/{number}", headers=headers, timeout=20)
         if r["status"] >= 400:
             result["error"] = f"GitHub API {r['status']}: {r['text'][:200]}"
+            if r.get("truncated"):
+                _mark_truncated(result, "http_error_body_limit_reached")
             return result
         issue = r["json"]
     except Exception as e:
@@ -293,6 +372,7 @@ def fetch_github_issue(owner: str, repo: str, number: int,
     page = 1
     per_page = min(max_comments, 100)
     fetched = 0
+    comments_fetch_failed = False
     while fetched < max_comments:
         try:
             r = _http_get(
@@ -303,10 +383,12 @@ def fetch_github_issue(owner: str, repo: str, number: int,
             )
             if r["status"] >= 400:
                 print(f"[fetch-thread] comment page {page} error: HTTP {r['status']}", file=sys.stderr)
+                comments_fetch_failed = True
                 break
             comments = r["json"]
         except Exception as e:
             print(f"[fetch-thread] comment page {page} error: {e}", file=sys.stderr)
+            comments_fetch_failed = True
             break
 
         if not comments:
@@ -329,28 +411,62 @@ def fetch_github_issue(owner: str, repo: str, number: int,
             break
         page += 1
 
-    # If it's a PR, also fetch review comments
+    result["metadata"]["fetched_comment_count"] = fetched
+    expected_comments = result["metadata"].get("comment_count") or 0
+    if expected_comments > fetched:
+        if comments_fetch_failed:
+            reason = "comments_fetch_incomplete"
+        elif fetched >= max_comments:
+            reason = "comments_limit_reached"
+        else:
+            reason = "comment_count_exceeds_fetched_count"
+        _mark_truncated(
+            result,
+            reason,
+        )
+
+    # If it's a PR, also fetch review summaries within the same output cap.
     if result["type"] == "github_pr":
-        try:
-            r = _http_get(
-                f"{base}/pulls/{number}/reviews",
-                headers=headers,
-                params={"per_page": 50},
-                timeout=20,
-            )
-            if r["status"] < 400 and r["json"]:
-                for review in r["json"]:
+        review_page = 1
+        review_fetched = 0
+        review_budget = max_comments - len(result["comments"])
+        if review_budget <= 0:
+            _mark_truncated(result, "pr_review_summaries_not_fetched_due_comment_limit")
+        while review_fetched < review_budget:
+            per_review_page = min(100, review_budget - review_fetched)
+            try:
+                r = _http_get(
+                    f"{base}/pulls/{number}/reviews",
+                    headers=headers,
+                    params={"per_page": per_review_page, "page": review_page},
+                    timeout=20,
+                )
+                if r["status"] >= 400 or not isinstance(r["json"], list):
+                    _mark_truncated(result, "review_comments_fetch_incomplete")
+                    break
+                reviews = r["json"]
+                if not reviews:
+                    break
+                for review in reviews:
                     body = review.get("body", "") or ""
                     if body.strip():
-                        result["comments"].append({
-                            "author": review.get("user", {}).get("login", ""),
-                            "date": review.get("submitted_at", ""),
-                            "body": f"[Review: {review.get('state', 'COMMENTED')}] {body}",
-                            "reactions": {},
-                        })
-                        all_text += "\n" + body
-        except Exception:
-            pass  # Non-critical
+                        if len(result["comments"]) < max_comments:
+                            result["comments"].append({
+                                "author": review.get("user", {}).get("login", ""),
+                                "date": review.get("submitted_at", ""),
+                                "body": f"[Review: {review.get('state', 'COMMENTED')}] {body}",
+                                "reactions": {},
+                            })
+                            all_text += "\n" + body
+                review_fetched += len(reviews)
+                if len(reviews) < per_review_page:
+                    break
+                review_page += 1
+            except Exception:
+                _mark_truncated(result, "review_comments_fetch_incomplete")
+                break
+        if review_budget > 0 and review_fetched >= review_budget:
+            _mark_truncated(result, "review_summaries_may_be_truncated_at_limit")
 
     # Extract all refs from combined text
     result["refs"] = extract_refs(all_text, repo_ctx)
@@ -382,6 +498,8 @@ def _enrich_with_timeline(owner: str, repo: str, number: int,
         if r["status"] != 200:
             return
         events = r["json"]
+        if isinstance(events, list) and len(events) >= 100:
+            _mark_truncated(result, "timeline_may_be_truncated_after_100_events")
     except Exception:
         return
 
@@ -431,6 +549,24 @@ def _enrich_with_timeline(owner: str, repo: str, number: int,
 # ---------------------------------------------------------------------------
 # Generic web page fetcher (fallback)
 # ---------------------------------------------------------------------------
+def _apply_web_fallback(result: dict, fallback: dict, reason: str) -> None:
+    """Merge generic-page recovery without mislabeling recovered content as a total failure."""
+    result["title"] = result.get("title") or fallback.get("title", "")
+    result["body"] = fallback.get("body", "")
+    result["links"] = fallback.get("links", [])
+    result["refs"] = fallback.get("refs", [])
+    result["fallback_from"] = {"provider": "platform_api", "reason": reason[:300]}
+    _mark_truncated(result, "platform_api_failed_web_fallback_used")
+    if fallback.get("truncated"):
+        fallback_reasons = fallback.get("truncation_reasons") or ["web_fallback_truncated"]
+        for truncation_reason in fallback_reasons:
+            _mark_truncated(result, truncation_reason)
+    if fallback.get("error"):
+        result["error"] = f"Platform API failed ({reason[:200]}); web fallback failed: {fallback['error'][:200]}"
+    elif not result["title"] and not result["body"]:
+        result["error"] = f"Platform API failed ({reason[:200]}); web fallback returned no content"
+
+
 def fetch_v2ex(url: str) -> dict:
     """Fetch a V2EX topic via API and extract structured content."""
     result = {
@@ -477,25 +613,35 @@ def fetch_v2ex(url: str) -> dict:
                 f"https://www.v2ex.com/api/replies/show.json?topic_id={topic_id}",
                 headers={"User-Agent": "fetch-thread/1.0"})
             if replies_data["status"] == 200 and replies_data["json"]:
-                for r in (replies_data["json"] or []):
+                raw_replies = replies_data["json"] or []
+                if not isinstance(raw_replies, list):
+                    raw_replies = []
+                for r in raw_replies[:MAX_COMMENTS]:
                     result["comments"].append({
                         "author": r.get("member", {}).get("username", ""),
                         "date": r.get("created", ""),
                         "body": r.get("content", ""),
                     })
+                if len(raw_replies) > MAX_COMMENTS:
+                    _mark_truncated(result, "comments_limit_reached")
+                result["metadata"]["fetched_comment_count"] = len(result["comments"])
+                if result["metadata"].get("reply_count", 0) > len(result["comments"]):
+                    reason = (
+                        "comments_limit_reached"
+                        if len(result["comments"]) >= MAX_COMMENTS
+                        else "reply_count_exceeds_fetched_count"
+                    )
+                    _mark_truncated(result, reason)
 
             all_text = result["body"] + " " + " ".join(c["body"] for c in result["comments"])
             result["refs"] = extract_refs(all_text)
         else:
-            raise Exception(f"V2EX API returned {topic_data['status']}")
+            suffix = " (error body truncated)" if topic_data.get("truncated") else ""
+            raise Exception(f"V2EX API returned {topic_data['status']}{suffix}")
 
     except Exception as e:
-        result["error"] = f"V2EX API failed: {e}, falling back to web fetch"
         fallback = fetch_web_page(url)
-        result["title"] = result["title"] or fallback.get("title", "")
-        result["body"] = fallback.get("body", "")
-        result["links"] = fallback.get("links", [])
-        result["refs"] = fallback.get("refs", [])
+        _apply_web_fallback(result, fallback, f"V2EX API failed: {e}")
 
     return result
 
@@ -529,7 +675,8 @@ def fetch_hn(url: str) -> dict:
             headers={"User-Agent": "fetch-thread/1.0"})
 
         if data["status"] != 200 or not data["json"]:
-            raise Exception(f"HN API returned {data['status']}")
+            suffix = " (error body truncated)" if data.get("truncated") else ""
+            raise Exception(f"HN API returned {data['status']}{suffix}")
 
         item = data["json"]
         result["title"] = item.get("title", "") or item.get("story_title", "")
@@ -544,7 +691,15 @@ def fetch_hn(url: str) -> dict:
 
         from html import unescape
 
-        def _parse_hn_comment(node: dict, depth: int = 0) -> dict:
+        comment_budget = {"count": 0, "truncated": False}
+
+        def _parse_hn_comment(node: dict, depth: int = 0) -> dict | None:
+            if comment_budget["count"] >= 200:
+                comment_budget["truncated"] = True
+                return None
+            if not node.get("author"):
+                return None
+            comment_budget["count"] += 1
             body = unescape(re.sub(r'<[^>]+>', ' ', node.get("text", "") or ""))
             body = re.sub(r'\s+', ' ', body).strip()
             c = {
@@ -553,48 +708,64 @@ def fetch_hn(url: str) -> dict:
                 "body": body,
                 "depth": depth,
             }
-            children = [
-                _parse_hn_comment(ch, depth + 1)
-                for ch in (node.get("children") or [])
-                if ch.get("author")
-            ]
+            children = []
+            child_nodes = node.get("children") or []
+            for index, child in enumerate(child_nodes):
+                parsed = _parse_hn_comment(child, depth + 1)
+                if parsed:
+                    children.append(parsed)
+                if comment_budget["count"] >= 200:
+                    if index < len(child_nodes) - 1:
+                        comment_budget["truncated"] = True
+                    break
             if children:
                 c["replies"] = children
             return c
 
-        def _flatten_comments(nodes: list, depth: int = 0, max_total: int = 200) -> list:
-            flat = []
-            for node in nodes:
-                if len(flat) >= max_total:
-                    break
-                if node.get("author"):
-                    flat.append(_parse_hn_comment(node, depth))
-            return flat
-
         children = item.get("children") or []
-        result["comments_tree"] = _flatten_comments(children, depth=0, max_total=200)
+        result["comments_tree"] = []
+        for index, node in enumerate(children):
+            parsed = _parse_hn_comment(node)
+            if parsed:
+                result["comments_tree"].append(parsed)
+            if comment_budget["count"] >= 200:
+                if index < len(children) - 1:
+                    comment_budget["truncated"] = True
+                break
         # backward-compat flat list (top-level only, max 50)
         result["comments"] = [
             {"author": c["author"], "date": c["date"], "body": c["body"]}
             for c in result["comments_tree"][:50]
         ]
+        result["metadata"]["fetched_comment_count"] = comment_budget["count"]
+        if comment_budget["truncated"]:
+            _mark_truncated(result, "comments_limit_reached")
+        if result["metadata"].get("comment_count", 0) > result["metadata"]["fetched_comment_count"]:
+            if not comment_budget["truncated"]:
+                _mark_truncated(result, "comment_count_exceeds_fetched_tree")
 
-        all_text = result["body"] + " " + " ".join(c["body"] for c in result["comments"])
+        all_text = result["body"] + " " + " ".join(
+            c.get("body", "") for c in _iter_nested_comments(result["comments_tree"])
+        )
         result["refs"] = extract_refs(all_text)
 
     except Exception as e:
-        result["error"] = f"HN API failed: {e}, falling back to web fetch"
         fallback = fetch_web_page(url)
-        result["title"] = result["title"] or fallback.get("title", "")
-        result["body"] = fallback.get("body", "")
-        result["links"] = fallback.get("links", [])
-        result["refs"] = fallback.get("refs", [])
+        _apply_web_fallback(result, fallback, f"HN API failed: {e}")
 
     return result
 
 
 def fetch_reddit(url: str, max_comments: int = 200) -> dict:
     """Fetch a Reddit post + comment tree via .json endpoint (no auth required)."""
+    try:
+        max_comments = max(1, min(MAX_COMMENTS, int(max_comments)))
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "url": url, "type": "web_page", "title": "", "body": "",
+            "state": None, "labels": [], "comments": [], "refs": [],
+            "links": [], "metadata": {}, "error": "max_comments must be an integer",
+        }
     result = {
         "url": url,
         "type": "reddit_post",
@@ -625,7 +796,8 @@ def fetch_reddit(url: str, max_comments: int = 200) -> dict:
         })
 
         if data["status"] != 200 or not data["json"]:
-            raise Exception(f"Reddit API returned {data['status']}")
+            suffix = " (error body truncated)" if data.get("truncated") else ""
+            raise Exception(f"Reddit API returned {data['status']}{suffix}")
 
         listing = data["json"]
         # Reddit returns [post_listing, comments_listing]
@@ -647,9 +819,15 @@ def fetch_reddit(url: str, max_comments: int = 200) -> dict:
 
         from html import unescape
 
+        comment_budget = {"count": 0, "truncated": False}
+
         def _parse_comment(node: dict, depth: int = 0) -> dict | None:
             if node.get("kind") != "t1":
                 return None
+            if comment_budget["count"] >= max_comments:
+                comment_budget["truncated"] = True
+                return None
+            comment_budget["count"] += 1
             d = node["data"]
             body = unescape(d.get("body", "") or "")
             c = {
@@ -662,15 +840,31 @@ def fetch_reddit(url: str, max_comments: int = 200) -> dict:
             replies_data = d.get("replies")
             if isinstance(replies_data, dict):
                 children = replies_data.get("data", {}).get("children", [])
-                sub = [_parse_comment(ch, depth + 1) for ch in children if depth < 4]
+                sub = []
+                child_nodes = children if depth < 4 else []
+                for index, child in enumerate(child_nodes):
+                    parsed = _parse_comment(child, depth + 1)
+                    if parsed:
+                        sub.append(parsed)
+                    if comment_budget["count"] >= max_comments:
+                        if index < len(child_nodes) - 1:
+                            comment_budget["truncated"] = True
+                        break
                 sub = [x for x in sub if x]
                 if sub:
                     c["replies"] = sub
             return c
 
         comments_raw = listing[1]["data"]["children"] if len(listing) > 1 else []
-        tree = [_parse_comment(n) for n in comments_raw]
-        tree = [c for c in tree if c]
+        tree = []
+        for index, node in enumerate(comments_raw):
+            parsed = _parse_comment(node)
+            if parsed:
+                tree.append(parsed)
+            if comment_budget["count"] >= max_comments:
+                if index < len(comments_raw) - 1:
+                    comment_budget["truncated"] = True
+                break
 
         # cap total nodes
         def _flatten(nodes, acc):
@@ -688,31 +882,33 @@ def fetch_reddit(url: str, max_comments: int = 200) -> dict:
             {"author": c["author"], "date": c["date"], "body": c["body"]}
             for c in flat[:max_comments]
         ]
+        result["metadata"]["fetched_comment_count"] = comment_budget["count"]
+        if comment_budget["truncated"]:
+            _mark_truncated(result, "comments_limit_reached")
+        if result["metadata"].get("comment_count", 0) > len(result["comments"]):
+            if not comment_budget["truncated"]:
+                _mark_truncated(result, "comment_count_exceeds_fetched_count")
 
         all_text = result["body"] + " " + " ".join(c["body"] for c in result["comments"])
         result["refs"] = extract_refs(all_text)
 
     except Exception as e:
-        result["error"] = f"Reddit API failed: {e}, falling back to web fetch"
         fallback = fetch_web_page(url)
-        result["title"] = result["title"] or fallback.get("title", "")
-        result["body"] = fallback.get("body", "")
-        result["links"] = fallback.get("links", [])
-        result["refs"] = fallback.get("refs", [])
+        _apply_web_fallback(result, fallback, f"Reddit API failed: {e}")
 
     return result
 
 
 def _detect_platform(url: str) -> str:
     """Detect platform from URL."""
-    host = urlparse(url).netloc.lower()
-    if "v2ex.com" in host:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if host == "v2ex.com" or host.endswith(".v2ex.com"):
         return "v2ex"
-    if "news.ycombinator.com" in host:
+    if host == "news.ycombinator.com":
         return "hn"
-    if "github.com" in host:
+    if host == "github.com" or host.endswith(".github.com"):
         return "github"
-    if "reddit.com" in host:
+    if host == "reddit.com" or host.endswith(".reddit.com"):
         return "reddit"
     return "web"
 
@@ -795,8 +991,12 @@ def fetch_web_page(url: str) -> dict:
         req = Request(url, method="GET", headers={
             "User-Agent": "Mozilla/5.0 (compatible; fetch-thread/1.0)"
         })
-        with urlopen(req, timeout=20) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+        with _safe_urlopen(req, timeout=_bounded_timeout(20)) as resp:
+            raw_html = resp.read(MAX_WEB_BODY_BYTES + 1)
+        html_truncated = len(raw_html) > MAX_WEB_BODY_BYTES
+        html = raw_html[:MAX_WEB_BODY_BYTES].decode("utf-8", errors="replace")
+        if html_truncated:
+            _mark_truncated(result, "html_body_byte_limit_reached")
 
         # Extract title
         title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.DOTALL | re.IGNORECASE)
@@ -841,6 +1041,8 @@ def fetch_web_page(url: str) -> dict:
             body_text = re.sub(r'\s+', ' ', text).strip()
 
         # Truncate to reasonable size
+        if len(body_text) > 10000:
+            _mark_truncated(result, "text_body_character_limit_reached")
         result["body"] = body_text[:10000]
 
         # Extract refs only from cleaned body text (reduce HTML noise)
@@ -879,6 +1081,11 @@ def format_markdown(data: dict) -> str:
         lines.append(f"Labels: {', '.join(data['labels'])}")
 
     lines.append("")
+
+    if data.get("truncated"):
+        reasons = data.get("truncation_reasons") or ["unspecified_limit"]
+        lines.append(f"⚠️ Content truncated: {', '.join(reasons)}")
+        lines.append("")
 
     if data.get("body"):
         lines.append("## Body")
@@ -919,6 +1126,15 @@ def fetch_thread_url(url: str, max_comments: int = 100) -> dict:
 
     Automatically detects platform (github/v2ex/hn/web) and routes accordingly.
     """
+    try:
+        _validate_http_url(url)
+    except ValueError as exc:
+        return {
+            "url": url, "type": "web_page", "title": "", "body": "",
+            "state": None, "labels": [], "comments": [], "refs": [],
+            "links": [], "metadata": {}, "error": str(exc),
+        }
+    max_comments = max(1, min(MAX_COMMENTS, int(max_comments)))
     platform = _detect_platform(url)
     token = _find_github_token()
 
@@ -949,34 +1165,18 @@ def main():
     ap.add_argument("url", help="URL to fetch (GitHub issue/PR/discussion or any web page)")
     ap.add_argument("--max-comments", type=int, default=100,
                     help="Max comments to fetch (default 100)")
+    ap.add_argument("--timeout", type=float, default=105,
+                    help="Overall request budget in seconds (default 105)")
     ap.add_argument("--extract-refs-only", action="store_true",
                     help="Only output the extracted references, not full thread")
     ap.add_argument("--format", choices=["json", "markdown"], default="json",
                     help="Output format (default: json)")
     args = ap.parse_args()
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be a finite positive number")
+    set_request_deadline(time.monotonic() + args.timeout)
 
-    platform = _detect_platform(args.url)
-    token = _find_github_token()
-
-    if platform == "github":
-        gh = _parse_github_url(args.url)
-        if gh and gh["type"] in ("issue", "pr"):
-            data = fetch_github_issue(
-                gh["owner"], gh["repo"], gh["number"],
-                token, args.max_comments)
-        elif gh and gh["type"] == "discussion":
-            data = fetch_web_page(args.url)
-            data["type"] = "github_discussion"
-        else:
-            data = fetch_web_page(args.url)
-    elif platform == "v2ex":
-        data = fetch_v2ex(args.url)
-    elif platform == "hn":
-        data = fetch_hn(args.url)
-    elif platform == "reddit":
-        data = fetch_reddit(args.url, args.max_comments)
-    else:
-        data = fetch_web_page(args.url)
+    data = fetch_thread_url(args.url, args.max_comments)
 
     if args.extract_refs_only:
         output = {

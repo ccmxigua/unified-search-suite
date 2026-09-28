@@ -17,6 +17,8 @@ def set_if_missing(k, v):
         return
     if os.environ.get(k):
         return
+    if k in out:
+        return
     out[k] = str(v)
 
 cred_path = Path.home() / '.openclaw' / 'credentials' / 'search.json'
@@ -63,7 +65,7 @@ if cfg_path.exists():
     set_if_missing('TAVILY_API_KEY', tavily.get('apiKey'))
     set_if_missing('EXA_API_KEY', exa.get('apiKey'))
 
-if not os.environ.get('TAVILY_API_BASE'):
+if not (out.get('TAVILY_API_BASE') or os.environ.get('TAVILY_API_BASE')):
     tavily_key = out.get('TAVILY_API_KEY') or os.environ.get('TAVILY_API_KEY', '')
     if tavily_key.startswith('mysp-'):
         out['TAVILY_API_BASE'] = 'http://127.0.0.1:9874/api'

@@ -13,14 +13,16 @@ Usage (standalone):
     --candidates '[{"url":"...","anchor":"...","context":"..."}]' \
     --threshold 0.5
 
-Output JSON:
+Output JSON (success):
   [{"url": "...", "anchor": "...", "context": "...", "score": 0.8, "reason": "..."}]
+Failure output is an object with `status`, `results`, and an optional `error`.
 """
 
 import json
 import os
 import sys
 import argparse
+import math
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -151,6 +153,7 @@ def score_candidates(
     knowledge_state: str = "",
     threshold: float = 0.4,
     creds: dict | None = None,
+    status_out: dict | None = None,
 ) -> list:
     """Score candidates and return those above threshold.
 
@@ -164,8 +167,27 @@ def score_candidates(
     Returns:
         Filtered + scored list: [{"url", "anchor", "context", "score", "reason"}]
     """
+    if not isinstance(candidates, list) or any(not isinstance(c, dict) for c in candidates):
+        raise ValueError("candidates must be a list of objects")
+    for candidate in candidates:
+        for field in ("url", "anchor", "context"):
+            if field in candidate and not isinstance(candidate[field], str):
+                raise ValueError(f"candidate {field} values must be strings")
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(threshold)
+        or not 0 <= threshold <= 1
+    ):
+        raise ValueError("threshold must be a finite number between 0 and 1")
     if not candidates:
+        if status_out is not None:
+            status_out["status"] = "empty"
         return []
+
+    def set_status(status: str) -> None:
+        if status_out is not None:
+            status_out["status"] = status
 
     if creds is None:
         creds = _load_creds()
@@ -175,9 +197,10 @@ def score_candidates(
     try:
         raw = _call_llm(prompt, creds)
     except Exception as e:
-        # On LLM failure, return all candidates unscored (fail open)
-        sys.stderr.write(f"[relevance_gate] LLM call failed: {e}, returning all candidates\n")
-        return [dict(c, score=0.5, reason="LLM unavailable") for c in candidates]
+        # A failed scorer cannot establish relevance; do not bypass threshold.
+        sys.stderr.write(f"[relevance_gate] LLM call failed: {e}; excluding unscored candidates\n")
+        set_status("unavailable")
+        return []
 
     # Parse JSON response
     try:
@@ -188,15 +211,48 @@ def score_candidates(
             text = text.rstrip("`").strip()
         scores = json.loads(text)
     except json.JSONDecodeError:
-        sys.stderr.write(f"[relevance_gate] Failed to parse LLM response: {raw[:200]}\n")
-        return [dict(c, score=0.5, reason="parse error") for c in candidates]
+        sys.stderr.write(f"[relevance_gate] Failed to parse LLM response: {raw[:200]}; excluding unscored candidates\n")
+        set_status("invalid_response")
+        return []
+
+    if not isinstance(scores, list):
+        sys.stderr.write("[relevance_gate] Invalid response: expected a list; excluding unscored candidates\n")
+        set_status("invalid_response")
+        return []
 
     # Merge scores back into candidates
-    score_map = {item["id"]: item for item in scores if "id" in item}
+    score_map = {}
+    for item in scores:
+        if not isinstance(item, dict):
+            sys.stderr.write("[relevance_gate] Invalid response item; excluding candidates\n")
+            set_status("invalid_response")
+            return []
+        item_id = item.get("id")
+        score = item.get("score")
+        if (
+            type(item_id) is not int
+            or not 1 <= item_id <= len(candidates)
+            or item_id in score_map
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(score)
+            or not 0 <= score <= 1
+            or ("reason" in item and not isinstance(item["reason"], str))
+        ):
+            sys.stderr.write("[relevance_gate] Invalid response id or score; excluding candidates\n")
+            set_status("invalid_response")
+            return []
+        score_map[item_id] = item
+    if len(score_map) != len(candidates):
+        sys.stderr.write("[relevance_gate] Incomplete response; excluding unscored candidates\n")
+        set_status("invalid_response")
+        return []
     result = []
     for i, c in enumerate(candidates, 1):
-        s = score_map.get(i, {})
-        score = float(s.get("score", 0.5))
+        s = score_map.get(i)
+        if s is None:
+            continue
+        score = float(s["score"])
         if score >= threshold:
             result.append({
                 **c,
@@ -206,6 +262,7 @@ def score_candidates(
 
     # Sort by score descending
     result.sort(key=lambda x: x["score"], reverse=True)
+    set_status("success" if result else "empty")
     return result
 
 
@@ -224,20 +281,25 @@ def main():
 
     try:
         candidates = json.loads(args.candidates)
-    except json.JSONDecodeError as e:
-        print(json.dumps({"error": f"Invalid candidates JSON: {e}"}))
-        sys.exit(1)
+        outcome = {}
+        results = score_candidates(
+            query=args.query,
+            candidates=candidates,
+            knowledge_state=args.knowledge,
+            threshold=args.threshold,
+            creds=_load_creds(),
+            status_out=outcome,
+        )
+    except (TypeError, ValueError) as e:
+        print(json.dumps({"status": "error", "error": str(e), "results": []}, ensure_ascii=False))
+        return 2
 
-    creds = _load_creds()
-    results = score_candidates(
-        query=args.query,
-        candidates=candidates,
-        knowledge_state=args.knowledge,
-        threshold=args.threshold,
-        creds=creds,
-    )
+    if outcome.get("status") in {"unavailable", "invalid_response"}:
+        print(json.dumps({"status": outcome["status"], "results": []}, ensure_ascii=False))
+        return 2
     print(json.dumps(results, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

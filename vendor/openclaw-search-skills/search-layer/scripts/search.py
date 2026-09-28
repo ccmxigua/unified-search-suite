@@ -29,6 +29,8 @@ import os
 import re
 import argparse
 import concurrent.futures
+import math
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 from pathlib import Path
@@ -36,6 +38,28 @@ import threading
 import importlib.util
 
 _TRANSLATION_CACHE = {}
+_REQUEST_DEADLINE = None
+_SOURCE_OUTCOMES = {}
+_SOURCE_OUTCOMES_LOCK = threading.Lock()
+
+
+def set_request_deadline(deadline):
+    global _REQUEST_DEADLINE
+    _REQUEST_DEADLINE = deadline
+
+
+def _bounded_timeout(timeout):
+    if _REQUEST_DEADLINE is None:
+        return timeout
+    remaining = _REQUEST_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exhausted")
+    return min(timeout, remaining)
+
+
+def _record_source_outcome(source, outcome):
+    with _SOURCE_OUTCOMES_LOCK:
+        _SOURCE_OUTCOMES.setdefault(source, set()).add(outcome)
 
 # Global concurrency limiter: cap total HTTP threads across nested pools.
 # Multi-query deep mode spawns outer_workers × 3 inner threads; this semaphore
@@ -46,8 +70,14 @@ _THREAD_SEMAPHORE = threading.Semaphore(8)
 def _throttled(fn):
     """Decorator: acquire global semaphore around a search-source call."""
     def wrapper(*args, **kwargs):
-        with _THREAD_SEMAPHORE:
+        timeout = None if _REQUEST_DEADLINE is None else _bounded_timeout(3600)
+        acquired = _THREAD_SEMAPHORE.acquire() if timeout is None else _THREAD_SEMAPHORE.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError("request deadline exhausted while waiting for a search slot")
+        try:
             return fn(*args, **kwargs)
+        finally:
+            _THREAD_SEMAPHORE.release()
     wrapper.__name__ = fn.__name__
     return wrapper
 
@@ -417,7 +447,7 @@ def search_grok(query: str, api_url: str, api_key: str, model: str = "grok-4.20-
             f"{api_url.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload,
-            timeout=1800,
+            timeout=_bounded_timeout(1800),
         )
         r.raise_for_status()
 
@@ -469,10 +499,12 @@ def search_grok(query: str, api_url: str, api_key: str, model: str = "grok-4.20-
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
+                _record_source_outcome("grok", "error")
                 print(f"[grok] error: non-JSON response: {raw[:200]}", file=sys.stderr)
                 return []
             choices = data.get("choices") or []
             if not choices:
+                _record_source_outcome("grok", "error")
                 print(f"[grok] error: no choices in response", file=sys.stderr)
                 return []
             choice = choices[0]
@@ -527,8 +559,10 @@ def search_grok(query: str, api_url: str, api_key: str, model: str = "grok-4.20-
                 "published_date": published_date,
                 "source": "grok",
             })
+        _record_source_outcome("grok", "success")
         return results
     except Exception as e:
+        _record_source_outcome("grok", "error")
         print(f"[grok] error: {e}", file=sys.stderr)
         return []
 
@@ -543,7 +577,7 @@ def search_tinyfish(query: str, key: str, num: int = 5,
             base_url,
             headers={"X-API-Key": key},
             params={"query": query, "num": num},
-            timeout=20,
+            timeout=_bounded_timeout(20),
         )
         r.raise_for_status()
         data = r.json()
@@ -564,8 +598,10 @@ def search_tinyfish(query: str, key: str, num: int = 5,
                 "published_date": "",
                 "source": "tinyfish",
             })
+        _record_source_outcome("tinyfish", "success")
         return results
     except Exception as e:
+        _record_source_outcome("tinyfish", "error")
         print(f"[tinyfish] error: {e}", file=sys.stderr)
         return []
 
@@ -698,6 +734,7 @@ def _exa_contents_payload(query: str, with_highlights: bool = True,
 
 
 def _post_exa_search(exa_url: str, key: str, payload: dict, timeout: int):
+    timeout = _bounded_timeout(timeout)
     r = requests.post(
         exa_url,
         headers={"x-api-key": key, "Content-Type": "application/json"},
@@ -772,6 +809,8 @@ def _translate_to_zh(text: str, limit: int = 700) -> str:
     clean = _clean_summary_text(text, limit=limit)
     if not clean or _has_substantial_cjk(clean):
         return clean if _has_substantial_cjk(clean) else ""
+    if os.environ.get("UNIFIED_SEARCH_DISABLE_TRANSLATION", "").strip().casefold() in {"1", "true", "yes"}:
+        return ""
     if not re.search(r"[A-Za-z]{4,}", clean):
         return ""
     key = clean[:limit]
@@ -791,7 +830,7 @@ def _translate_to_zh(text: str, limit: int = 700) -> str:
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "application/json,text/plain,*/*",
             },
-            timeout=5,
+            timeout=_bounded_timeout(5),
         )
         r.raise_for_status()
         payload = r.json()
@@ -898,8 +937,10 @@ def search_exa(query: str, key: str, num: int = 5,
                 "source": "exa",
                 "meta": {"exaType": resolved_search_type},
             })
+        _record_source_outcome("exa", "success")
         return results
     except Exception as e:
+        _record_source_outcome("exa", "error")
         print(f"[exa] error: {e}", file=sys.stderr)
         return []
 
@@ -929,7 +970,7 @@ def search_tavily(query: str, key: str, num: int = 5,
             endpoint,
             headers={"Content-Type": "application/json"},
             json={"api_key": key, **payload},
-            timeout=20,
+            timeout=_bounded_timeout(20),
         )
         r.raise_for_status()
         data = r.json()
@@ -951,8 +992,10 @@ def search_tavily(query: str, key: str, num: int = 5,
                 "published_date": published_date,
                 "source": "tavily",
             })
+        _record_source_outcome("tavily", "success")
         return {"results": results, "answer": data.get("answer")}
     except Exception as e:
+        _record_source_outcome("tavily", "error")
         print(f"[tavily] error: {e}", file=sys.stderr)
         return {"results": [], "answer": None}
 
@@ -1241,6 +1284,7 @@ def execute_search(query: str, mode: str, keys: dict, num: int,
                 try:
                     res = fut.result()
                 except Exception as e:
+                    _record_source_outcome(name, "error")
                     print(f"[{name}] error: {e}", file=sys.stderr)
                     continue
                 if isinstance(res, dict):
@@ -1284,6 +1328,7 @@ def _run_extract_refs(urls: list) -> list:
     ft = _load_fetch_thread()
     if not ft:
         return [{"error": "fetch_thread module not available"}]
+    ft.set_request_deadline(_REQUEST_DEADLINE)
 
     results = []
 
@@ -1296,11 +1341,19 @@ def _run_extract_refs(urls: list) -> list:
                     gh["owner"], gh["repo"], gh["number"], token, max_comments=50)
             else:
                 data = ft.fetch_web_page(url)
-            return {
+            item = {
                 "source_url": url,
                 "refs": data.get("refs", []),
                 "ref_count": len(data.get("refs", [])),
             }
+            if data.get("error"):
+                item["error"] = data["error"]
+            if data.get("truncated"):
+                item["truncated"] = True
+                item["truncation_reasons"] = data.get("truncation_reasons", [])
+            if data.get("fallback_from"):
+                item["fallback_from"] = data["fallback_from"]
+            return item
         except Exception as e:
             return {"source_url": url, "refs": [], "ref_count": 0,
                     "error": str(e)}
@@ -1322,7 +1375,7 @@ def _head_check(url: str, timeout: int = 5) -> tuple:
     try:
         r = requests.head(
             url,
-            timeout=timeout,
+            timeout=_bounded_timeout(timeout),
             allow_redirects=True,
             headers={
                 'User-Agent': (
@@ -1395,7 +1448,15 @@ def main():
                     help="Extract refs from these URLs directly (skip search)")
     ap.add_argument("--verify-urls", action="store_true",
                     help="Verify result URLs with HEAD requests (flags 404 as potentially fake)")
+    ap.add_argument("--timeout", type=float,
+                    default=float(os.environ.get("UNIFIED_SEARCH_TIMEOUT_SECONDS", "105")),
+                    help="Overall search request budget in seconds (default: 105)")
     args = ap.parse_args()
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be a finite positive number")
+    set_request_deadline(time.monotonic() + args.timeout)
+    with _SOURCE_OUTCOMES_LOCK:
+        _SOURCE_OUTCOMES.clear()
 
     # Determine queries
     queries = []
@@ -1405,13 +1466,19 @@ def main():
         queries = [args.query]
     elif args.extract_refs_urls:
         # No search needed, just extract refs from provided URLs
+        refs = _run_extract_refs(args.extract_refs_urls)
+        failed = sum(bool(item.get("error")) for item in refs if isinstance(item, dict))
+        partial = sum(bool(item.get("truncated")) for item in refs if isinstance(item, dict))
+        succeeded = len(refs) - failed
         output = {
             "mode": "extract-refs-only",
             "intent": args.intent,
             "queries": [],
             "count": 0,
             "results": [],
-            "refs": _run_extract_refs(args.extract_refs_urls),
+            "refs": refs,
+            "status": "error" if failed and not succeeded else "partial" if failed or partial else "success",
+            "refs_status": {"total": len(refs), "failed": failed, "truncated": partial},
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return
@@ -1426,18 +1493,51 @@ def main():
     if args.source:
         source_filter = {s.strip() for s in args.source.split(",")}
 
+    available = set()
+    if keys.get("exa"):
+        available.add("exa")
+    if keys.get("tavily"):
+        available.add("tavily")
+    if keys.get("grok_key") and keys.get("grok_url"):
+        available.add("grok")
+    if keys.get("tinyfish"):
+        available.add("tinyfish")
+    selected = available if source_filter is None else available & source_filter
+    if args.mode == "fast":
+        active_sources = {"exa"} if "exa" in selected else ({"grok"} if "grok" in selected else set())
+    elif args.mode == "answer":
+        active_sources = selected & {"tavily"}
+    else:
+        active_sources = selected
+    if not active_sources:
+        print(json.dumps({
+            "status": "error",
+            "error": {"code": "no_search_provider", "message": "No configured search provider is available for this mode/source filter."},
+            "mode": args.mode,
+            "intent": args.intent,
+            "queries": queries,
+            "count": 0,
+            "results": [],
+            "provider_status": {},
+        }, ensure_ascii=False, indent=2))
+        raise SystemExit(2)
+
     # Execute all queries (parallel if multiple)
     all_results = []
     answer_text = None
+    query_errors = []
 
     if len(queries) == 1:
-        results, answer_text = execute_search(
-            queries[0], args.mode, keys, args.num,
-            include_answer=(args.mode == "answer"),
-            freshness=args.freshness,
-            sources=source_filter,
-            intent=args.intent)
-        all_results = results
+        try:
+            results, answer_text = execute_search(
+                queries[0], args.mode, keys, args.num,
+                include_answer=(args.mode == "answer"),
+                freshness=args.freshness,
+                sources=source_filter,
+                intent=args.intent)
+            all_results = results
+        except Exception as e:
+            query_errors.append({"query": queries[0], "error": str(e)[:300]})
     else:
         # Cap outer concurrency: each query may spawn up to 3 inner threads (deep mode),
         # so limit outer workers to avoid thread explosion (outer × inner ≤ semaphore cap)
@@ -1451,7 +1551,12 @@ def main():
                 for q in queries
             }
             for fut in concurrent.futures.as_completed(futures):
-                results, ans = fut.result()
+                query = futures[fut]
+                try:
+                    results, ans = fut.result()
+                except Exception as e:
+                    query_errors.append({"query": query, "error": str(e)[:300]})
+                    continue
                 all_results.extend(results)
                 if ans and not answer_text:
                     answer_text = ans
@@ -1480,6 +1585,37 @@ def main():
         "count": len(deduped),
         "results": deduped,
     }
+    with _SOURCE_OUTCOMES_LOCK:
+        source_outcomes = {name: set(states) for name, states in _SOURCE_OUTCOMES.items()}
+    provider_status = {}
+    for name in sorted(active_sources):
+        states = source_outcomes.get(name, set())
+        if states == {"success", "error"}:
+            provider_status[name] = "partial"
+        elif "error" in states:
+            provider_status[name] = "error"
+        elif "success" in states:
+            provider_status[name] = "success"
+        else:
+            provider_status[name] = "not_run"
+    provider_errors = sorted(
+        name for name, state in provider_status.items()
+        if state in {"error", "partial"}
+    )
+    any_success = any(state in {"success", "partial"} for state in provider_status.values())
+    any_error = bool(provider_errors or query_errors)
+    if any_error and (any_success or deduped):
+        output["status"] = "partial"
+    elif any_error:
+        output["status"] = "error"
+    elif not deduped:
+        output["status"] = "empty"
+    else:
+        output["status"] = "success"
+    output["provider_status"] = provider_status
+    output["provider_errors"] = provider_errors
+    if query_errors:
+        output["query_errors"] = query_errors
     if answer_text:
         output["answer"] = answer_text
         answer_zh = _translate_to_zh(answer_text, limit=500)
@@ -1495,7 +1631,11 @@ def main():
         mode=args.mode,
         intent=args.intent,
     )
-    if research_profile == "research-light" and "exa" in keys:
+    if (
+        research_profile == "research-light"
+        and "exa" in keys
+        and (source_filter is None or "exa" in source_filter)
+    ):
         research_context = _build_research_context(deduped)
         research = _run_exa_research_light(
             query=queries[0] if queries else "",
@@ -1513,6 +1653,16 @@ def main():
         output["refs"] = _run_extract_refs(
             urls=args.extract_refs_urls or [r["url"] for r in deduped],
         )
+        ref_items = output["refs"]
+        ref_failures = sum(bool(item.get("error")) for item in ref_items if isinstance(item, dict))
+        ref_truncated = sum(bool(item.get("truncated")) for item in ref_items if isinstance(item, dict))
+        output["refs_status"] = {
+            "total": len(ref_items),
+            "failed": ref_failures,
+            "truncated": ref_truncated,
+        }
+        if (ref_failures or ref_truncated) and output.get("status") != "error":
+            output["status"] = "partial"
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
 

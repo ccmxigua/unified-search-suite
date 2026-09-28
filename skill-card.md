@@ -1,5 +1,5 @@
 ## Description: <br>
-Unified web search and deep research suite that routes ordinary queries to a deep search layer using Exa, Tavily, and Grok, while retaining legacy Tavily, Exa, and Google merged search. <br>
+Unified web search and deep research suite that routes ordinary queries to the vendored deep search layer. The legacy merged-search implementation is not included in this repository snapshot. <br>
 
 This skill is ready for commercial/non-commercial use. <br>
 
@@ -7,7 +7,7 @@ This skill is ready for commercial/non-commercial use. <br>
 [ccmxigua](https://clawhub.ai/user/ccmxigua) <br>
 
 ### License/Terms of Use: <br>
-MIT-0 <br>
+MIT <br>
 
 
 ## Use Case: <br>
