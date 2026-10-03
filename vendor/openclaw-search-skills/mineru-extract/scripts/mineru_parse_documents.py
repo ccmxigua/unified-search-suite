@@ -29,6 +29,7 @@ import pathlib
 import re
 import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -55,6 +56,28 @@ MAX_ZIP_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_ZIP_EXPANDED_BYTES = 512 * 1024 * 1024
 MAX_ZIP_COMPRESSION_RATIO = 500
 _REQUEST_DEADLINE = None
+
+
+class MinerUTaskError(RuntimeError):
+    """A submitted task failed locally or remotely, with a durable resume handle."""
+
+    def __init__(self, message, *, task_id, state, checkpoint_path):
+        super().__init__(message)
+        self.task = {"task_id": task_id, "state": state,
+                     "checkpoint_path": str(checkpoint_path), "resumable": state != "failed"}
+
+
+def _write_json_atomic(path, value):
+    fd, temporary = tempfile.mkstemp(prefix=".mineru-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _set_request_deadline(deadline: float | None) -> None:
@@ -200,7 +223,7 @@ def create_task(*, api_base: str, token: str, payload: dict) -> str:
     return str(task_id)
 
 
-def poll_task(*, api_base: str, token: str, task_id: str, timeout_sec: int, poll_interval: float) -> dict:
+def poll_task(*, api_base: str, token: str, task_id: str, timeout_sec: int, poll_interval: float, on_update=None) -> dict:
     endpoint = api_base.rstrip("/") + f"/api/v4/extract/task/{task_id}"
     start = time.monotonic()
     last_state = None
@@ -210,6 +233,8 @@ def poll_task(*, api_base: str, token: str, task_id: str, timeout_sec: int, poll
             raise RuntimeError(f"MinerU poll failed: {res}")
         data = res.get("data") or {}
         state = data.get("state")
+        if on_update is not None:
+            on_update(data)
         if state and state != last_state:
             print(f"state={state}", file=sys.stderr)
             last_state = state
@@ -361,9 +386,13 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
     if extra_formats:
         payload["extra_formats"] = extra_formats
 
-    key = _cache_key(payload)
+    # Keep the original key for the official endpoint so upgrades can reuse
+    # completed caches. Custom endpoints get a separate namespace from now on.
+    key = _cache_key(payload if api_base.rstrip("/") == "https://mineru.net"
+                     else {"api_base": api_base.rstrip("/"), "payload": payload})
     out_dir = _cache_root() / key
     meta_path = out_dir / "meta.json"
+    checkpoint_path = out_dir / "task.json"
 
     if cache and (not force) and meta_path.exists():
         try:
@@ -381,21 +410,53 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
             pass
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    task_id = create_task(api_base=api_base, token=token, payload=payload)
-    data = poll_task(api_base=api_base, token=token, task_id=task_id, timeout_sec=timeout_sec, poll_interval=poll_interval)
+    checkpoint = None
+    if checkpoint_path.exists() and not force:
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if (not isinstance(checkpoint, dict) or checkpoint.get("cache_key") != key
+                    or checkpoint.get("api_base") != api_base.rstrip("/")
+                    or not isinstance(checkpoint.get("task_id"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", checkpoint["task_id"])):
+                raise ValueError("Invalid task checkpoint")
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Unreadable MinerU task checkpoint {checkpoint_path}; use --force to submit a new task") from exc
+    resumed = checkpoint is not None
+    if checkpoint is None:
+        task_id = create_task(api_base=api_base, token=token, payload=payload)
+        checkpoint = {"cache_key": key, "api_base": api_base.rstrip("/"),
+                      "task_id": task_id, "state": "submitted", "created_at": int(time.time())}
+    task_id = checkpoint["task_id"]
 
-    full_zip_url = data.get("full_zip_url")
-    if not full_zip_url:
-        raise RuntimeError(f"No full_zip_url in done task: {data}")
-    if not _is_url(full_zip_url):
-        raise ValueError("MinerU returned an invalid archive URL")
-    zip_bytes = _http_bytes(full_zip_url, timeout=180)
-    zip_path = out_dir / f"{_sanitize(task_id)}.zip"
-    zip_path.write_bytes(zip_bytes)
+    def save_progress(data):
+        checkpoint.update(state=data.get("state") or checkpoint["state"],
+                          updated_at=int(time.time()), error=data.get("err_msg") or "")
+        _write_json_atomic(checkpoint_path, checkpoint)
 
-    md_path = extract_main_markdown(zip_bytes, out_dir / f"extract-{_sanitize(task_id)}")
-    if not md_path or not md_path.is_file() or md_path.stat().st_size <= 0:
-        raise RuntimeError("MinerU result archive contains no non-empty Markdown file")
+    try:
+        _write_json_atomic(checkpoint_path, checkpoint)
+        if checkpoint.get("state") == "failed":
+            raise RuntimeError(checkpoint.get("error") or "MinerU task failed; use --force to retry")
+        print(f"task_id={task_id} resumed={str(resumed).lower()}", file=sys.stderr)
+        data = poll_task(api_base=api_base, token=token, task_id=task_id,
+                         timeout_sec=timeout_sec, poll_interval=poll_interval, on_update=save_progress)
+        save_progress(data)
+
+        full_zip_url = data.get("full_zip_url")
+        if not full_zip_url:
+            raise RuntimeError("Completed MinerU task has no full_zip_url")
+        if not _is_url(full_zip_url):
+            raise ValueError("MinerU returned an invalid archive URL")
+        zip_bytes = _http_bytes(full_zip_url, timeout=180)
+        zip_path = out_dir / f"{_sanitize(task_id)}.zip"
+        zip_path.write_bytes(zip_bytes)
+
+        md_path = extract_main_markdown(zip_bytes, out_dir / f"extract-{_sanitize(task_id)}")
+        if not md_path or not md_path.is_file() or md_path.stat().st_size <= 0:
+            raise RuntimeError("MinerU result archive contains no non-empty Markdown file")
+    except Exception as exc:
+        raise MinerUTaskError(str(exc), task_id=task_id, state=checkpoint.get("state", "unknown"),
+                              checkpoint_path=checkpoint_path) from exc
 
     result = {
         "ok": True,
@@ -411,6 +472,7 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
         "zip_path": str(zip_path),
         "markdown_path": str(md_path) if md_path else None,
         "cached": False,
+        "resumed": resumed,
         "cache_key": key,
         "zip_size": zip_path.stat().st_size,
         "zip_sha256": _file_sha256(zip_path),
@@ -418,7 +480,7 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
         "markdown_sha256": _file_sha256(md_path),
         "fetched_at": int(time.time()),
     }
-    meta_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(meta_path, result)
     return result
 
 
@@ -507,11 +569,16 @@ def main() -> int:
                     meta["markdown"] = txt
             items.append(meta)
         except Exception as e:
-            errors.append({
+            error = {
                 "source": src,
                 "error": str(e),
                 "next_step": "If this is a protected page, try another accessible mirror URL.",
-            })
+            }
+            if isinstance(e, MinerUTaskError):
+                error["task"] = e.task
+                error["next_step"] = ("Retry the same command to resume the saved task." if e.task["resumable"]
+                                      else "The service reported failure; use --force to submit a new task.")
+            errors.append(error)
 
     ok = len(errors) == 0
     out = {"ok": ok, "items": items, "errors": errors}

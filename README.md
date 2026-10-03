@@ -21,6 +21,8 @@ See [SKILL.md](./SKILL.md) for full documentation.
 Search can restrict domains and publication dates, then extract full text from the
 top results within a shared time budget. The MCP server exposes configurable search,
 standalone content extraction and discussion fetching. MinerU fallback is opt-in.
+Text PDFs can be read locally without waiting for the cloud queue. MinerU document
+parsing records task IDs so a timed-out request can resume instead of resubmitting.
 
 ```bash
 bash scripts/unified-search.sh search-layer "Python asyncio documentation" \

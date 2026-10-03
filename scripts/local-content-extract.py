@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import importlib.util
+import subprocess
 import ipaddress
 import math
 import os
@@ -92,7 +93,7 @@ def _fetch_html(url, deadline):
                 continue
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-            if content_type and content_type not in {"text/html", "text/plain", "application/xhtml+xml"}:
+            if content_type and content_type not in {"text/html", "text/plain", "application/xhtml+xml", "application/pdf", "application/octet-stream"}:
                 raise ValueError(f"Unsupported local content type: {content_type}")
             chunks, size = [], 0
             for chunk in response.iter_content(65536):
@@ -101,12 +102,31 @@ def _fetch_html(url, deadline):
                 if size > MAX_BODY_BYTES:
                     raise ValueError("Page exceeds the 5 MiB extraction limit")
                 chunks.append(chunk)
-            html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
-            return html, {"status_code": response.status_code, "content_type": content_type, "final_url": current}
+            body = b"".join(chunks)
+            artifacts = {"status_code": response.status_code, "content_type": content_type, "final_url": current}
+            if body.lstrip().startswith(b"%PDF-") or content_type == "application/pdf":
+                return body, artifacts
+            if content_type == "application/octet-stream":
+                raise ValueError("Unsupported binary document; expected a PDF")
+            return body.decode(response.encoding or "utf-8", errors="replace"), artifacts
     raise ValueError("Too many redirects")
 
 
-def _mineru_extract(url, timeout, max_chars):
+def _extract_pdf(body, deadline, max_chars):
+    # A subprocess makes CPU-heavy parsing interruptible, including decompression.
+    worker = Path(__file__).with_name("pdf-text-extract.py")
+    try:
+        result = subprocess.run([sys.executable, str(worker), str(max_chars)], input=body,
+                                capture_output=True, timeout=_remaining(deadline))
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("PDF text extraction deadline exhausted") from exc
+    if result.returncode:
+        raise ValueError("PDF text extraction failed: " + result.stderr.decode("utf-8", "replace")[-300:])
+    data = json.loads(result.stdout)
+    return data["text"], data["artifacts"]
+
+
+def _mineru_extract(url, timeout, max_chars, *, is_pdf=False):
     path = Path(__file__).resolve().parents[1] / "vendor/openclaw-search-skills/mineru-extract/scripts/mineru_parse_documents.py"
     spec = importlib.util.spec_from_file_location("mineru_content_fallback", path)
     module = importlib.util.module_from_spec(spec)
@@ -115,7 +135,7 @@ def _mineru_extract(url, timeout, max_chars):
     token = os.environ.get("MINERU_TOKEN")
     if not token:
         raise ValueError("MinerU fallback requires MINERU_TOKEN")
-    model = "pipeline" if urlsplit(url).path.lower().endswith((".pdf", ".doc", ".docx", ".ppt", ".pptx")) else "MinerU-HTML"
+    model = "pipeline" if is_pdf or urlsplit(url).path.lower().endswith((".pdf", ".doc", ".docx", ".ppt", ".pptx")) else "MinerU-HTML"
     meta = module.parse_one_url(
         api_base=os.environ.get("MINERU_API_BASE", "https://mineru.net"), token=token,
         source_url=url, enable_ocr=False, language="ch", page_ranges=None, model_version=model,
@@ -138,44 +158,60 @@ def extract_content(url, timeout=30, max_chars=20000, fallback="none"):
         out.update(error=str(exc), quality="empty", status="error")
         return out
     best = ""
+    is_pdf = False
     try:
         html, artifacts = _fetch_html(url, deadline)
         out["artifacts"] = artifacts
         if artifacts["final_url"] != url:
             out["sources"].append(artifacts["final_url"])
-        try:
-            best = (trafilatura.extract(html, url=artifacts["final_url"], output_format="markdown",
-                    include_links=True, include_formatting=True, favor_precision=True, deduplicate=True) or "").strip()
-            out["attempts"].append({"engine": "trafilatura", "ok": bool(best), "chars": len(best)})
-        except Exception as exc:
-            out["attempts"].append({"engine": "trafilatura", "ok": False, "error": str(exc)[:300]})
-        if len(best) < MIN_CONTENT_CHARS:
-            alternative = fallback_markdown(html)
-            out["attempts"].append({"engine": "beautifulsoup", "ok": bool(alternative), "chars": len(alternative)})
-            if len(alternative) > len(best):
-                best, out["engine"] = alternative, "beautifulsoup"
+        is_pdf = isinstance(html, bytes)
+        if is_pdf:
+            out["engine"] = "pypdf"
+            best, pdf_artifacts = _extract_pdf(html, deadline, max_chars)
+            out["artifacts"].update(pdf_artifacts)
+            out["attempts"].append({"engine": "pypdf", "ok": bool(best), "chars": len(best)})
+        else:
+            try:
+                best = (trafilatura.extract(html, url=artifacts["final_url"], output_format="markdown",
+                        include_links=True, include_formatting=True, favor_precision=True, deduplicate=True) or "").strip()
+                out["attempts"].append({"engine": "trafilatura", "ok": bool(best), "chars": len(best)})
+            except Exception as exc:
+                out["attempts"].append({"engine": "trafilatura", "ok": False, "error": str(exc)[:300]})
+            if len(best) < MIN_CONTENT_CHARS:
+                alternative = fallback_markdown(html)
+                out["attempts"].append({"engine": "beautifulsoup", "ok": bool(alternative), "chars": len(alternative)})
+                if len(alternative) > len(best):
+                    best, out["engine"] = alternative, "beautifulsoup"
     except UnsafeURL as exc:
         out.update(error=str(exc), quality="empty", status="error")
         out["attempts"].append({"engine": "local_fetch", "ok": False, "error": str(exc)})
         return out
     except Exception as exc:
         out["attempts"].append({"engine": "local_fetch", "ok": False, "error": str(exc)[:300]})
-    if len(best) < MIN_CONTENT_CHARS and fallback == "mineru":
+    needs_fallback = (not best or out["artifacts"].get("pdf_text_incomplete")
+                      or (not is_pdf and len(best) < MIN_CONTENT_CHARS))
+    if needs_fallback and fallback == "mineru":
         try:
-            markdown, artifacts = _mineru_extract(url, _remaining(deadline), max_chars)
+            markdown, artifacts = _mineru_extract(url, _remaining(deadline), max_chars, is_pdf=is_pdf)
             out["attempts"].append({"engine": "mineru", "ok": bool(markdown), "chars": len(markdown)})
             if len(markdown) > len(best):
                 best, out["engine"], out["artifacts"] = markdown, "mineru", artifacts
         except Exception as exc:
             out["attempts"].append({"engine": "mineru", "ok": False, "error": str(exc)[:300]})
+            if isinstance(getattr(exc, "task", None), dict):
+                out["mineru_task"] = exc.task
     out["notes"] = [a["error"] for a in out["attempts"] if a.get("error")]
-    out["quality"] = "sufficient" if len(best) >= MIN_CONTENT_CHARS else "low" if best else "empty"
+    pdf_usable = out["engine"] == "pypdf" and bool(best) and not out["artifacts"].get("pdf_text_incomplete")
+    sufficient = pdf_usable or (len(best) >= MIN_CONTENT_CHARS and not out["artifacts"].get("pdf_text_incomplete"))
+    out["quality"] = "sufficient" if sufficient else "low" if best else "empty"
     out["ok"] = bool(best)
     out["status"] = "success" if out["quality"] == "sufficient" else "partial" if best else "error"
-    out["truncated"] = bool(max_chars and len(best) > max_chars)
+    out["truncated"] = len(best) > max_chars or bool(out["artifacts"].get("pdf_truncated"))
     if out["truncated"]:
         best = best[:max_chars]
         out["notes"].append(f"truncated to {max_chars} chars")
+    if out["engine"] == "pypdf":
+        out["notes"].append("PDF text layer only; no OCR or table/formula layout reconstruction.")
     out["markdown"] = best or None
     return out
 

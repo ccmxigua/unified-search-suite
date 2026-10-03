@@ -2,4 +2,5 @@ beautifulsoup4
 lxml[html-clean]
 mcp>=1.12,<2
 requests
+pypdf>=6.19,<7
 trafilatura

@@ -169,10 +169,11 @@ def unified_search(
 @mcp.tool()
 def extract_content(url: str, timeout: float = 30, max_chars: int = 20000,
                     fallback: Literal["none", "mineru"] = "none") -> str:
-    """Extract a public HTTP(S) page into Markdown, with quality/attempt metadata.
+    """Extract public HTTP(S) HTML or PDF text, with quality/attempt metadata.
 
     Explicit fallback=mineru may call the configured external MinerU API for
-    failed or short local extraction. max_chars is 1-200000.
+    failed or short local extraction. Text PDFs use local extraction without OCR;
+    cloud errors preserve resumable task handles. max_chars is 1-200000.
     """
     if not 1 <= max_chars <= 200000 or fallback not in {"none", "mineru"}:
         return _invalid("Invalid extraction limits or fallback")

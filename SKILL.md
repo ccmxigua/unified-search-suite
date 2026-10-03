@@ -10,7 +10,7 @@ This skill is now a **two-layer search suite**:
 1. **Vendored deep-research stack** — now the default for ordinary `/unified_search <query>` calls
    - `search-layer`: Exa + Tavily + Grok multi-source search with intent-aware scoring
    - `fetch-thread`: deep thread / issue / PR / forum context extraction
-   - `content-extract`: local URL → Markdown extraction with opt-in MinerU fallback
+   - `content-extract`: local HTML/PDF text extraction with opt-in MinerU fallback
    - `mineru-extract`: official MinerU parsing wrapper
 2. **Legacy merged search** — compatibility route via `--legacy` or the explicit `legacy` subcommand, provided `scripts/unified-search-legacy.sh` is installed
    - Engines: **Tavily + Exa + Google**
@@ -78,7 +78,13 @@ Run:
 
 ```bash
 bash scripts/unified-search.sh content-extract --url "https://mp.weixin.qq.com/s/example"
+bash scripts/unified-search.sh content-extract --url "https://example.com/document.pdf"
 ```
+
+For ordinary text PDFs, use `content-extract` to read the embedded text locally.
+The automatic document-URL route and explicit `mineru-*` commands still request
+cloud parsing. Local PDF extraction does not perform OCR or reconstruct table and
+formula layout; scanned pages require an available OCR/cloud service.
 
 ### E. MinerU direct parsing
 
@@ -127,7 +133,7 @@ mark the overall status partial. Setting `--content-fallback mineru` explicitly 
 into the external MinerU API and requires `MINERU_TOKEN`. It does not increase the
 overall deadline, so allow enough time for parsing.
 
-The extractor tries Trafilatura, then BeautifulSoup for empty/short output. Fewer
+For HTML, the extractor tries Trafilatura, then BeautifulSoup for empty/short output. Fewer
 than 200 characters is marked `quality=low`; this length heuristic does not verify
 factual accuracy or article completeness. Optional MinerU fallback runs only after
 failed/short local extraction. Output retains `attempts`, `notes`, provenance and
@@ -135,6 +141,29 @@ failed/short local extraction. Output retains `attempts`, `notes`, provenance an
 capped at 5 MiB and five redirects. Local hostnames, non-public literal IPs and
 embedded URL credentials are rejected on each hop; DNS rebinding protection is
 still outside this boundary.
+
+PDF responses use `pypdf` before any external fallback. A short PDF with text on
+every inspected page can succeed even below 200 characters. Blank pages are counted
+in `pdf_empty_pages` and mark the local text incomplete; usable text is preserved if
+cloud fallback fails. `pdf_pages_read`, `pdf_pages` and `truncated` expose coverage
+and output limits. PDFs share the 5 MiB download cap, with a 200-page limit and a
+16 MiB decoded content-stream limit per page. PDF parsing runs in a separate process
+with an interruptible deadline and bounded Flate decompression. Linux also enforces
+a 512 MiB address-space limit; macOS has no process memory cap. This is text-layer
+extraction, not a guarantee that images or complex layout have been captured.
+
+The `mineru-parse-documents` route and `content-extract` MinerU fallback save each
+submitted task immediately to `<workspace>/mineru-cache/<request-key>/task.json`.
+Repeating the same request after timeout resumes that task; a failed download also
+reuses it. Errors include the task ID, last state, checkpoint path and whether it
+is resumable (`task` in direct parsing errors, `mineru_task` in extraction output).
+`pending` means the service is still queuing; it does not mean parsing succeeded.
+Different API endpoints or parsing parameters have separate request keys.
+`--no-cache` skips completed-result reuse but still resumes recorded tasks.
+`--force` explicitly submits a new task on every invocation, including after a
+terminal service failure or invalid checkpoint. Normal retries do not repeatedly
+submit failed tasks. Existing official-endpoint caches retain their original keys;
+custom endpoints use new keys to avoid mixing results between services.
 
 Standalone extraction also requires `--max-chars` in 1-200000; the former zero
 value for unlimited text is rejected to keep CLI, search and MCP output bounded.
@@ -165,7 +194,7 @@ truncation. A requested longer timeout cannot exceed `UNIFIED_SEARCH_MCP_TIMEOUT
 - Search exits non-zero when its overall status is `error`; valid empty searches and partial results retain exit code 0. Multi-query intent scoring uses the best match across all queries, so later queries and translated variants are not penalized by the first query's wording.
 - The standalone relevance gate fails closed when the scorer is unavailable or returns malformed/incomplete scores; it emits a structured failure object and non-zero exit status in those cases.
 - MinerU downloads are capped at 100 MiB. ZIP extraction is bounded to 5,000 members, 128 MiB per member, 512 MiB expanded total, and a 500:1 compression ratio; unsafe paths and symlinks are rejected. Request deadlines also bound polling and network calls.
-- The bundled `content-extract` route uses its local extractor: `--timeout` controls the HTTP request (default 30 seconds), and `--max-chars` controls the returned text. The vendored MinerU fallback wrapper is a separate implementation.
+- The bundled `content-extract` route uses local HTML/PDF extraction: `--timeout` controls the shared extraction budget (default 30 seconds), and `--max-chars` controls returned text. Its optional MinerU fallback uses `mineru_parse_documents.py`; the explicit `mineru-extract` route is a separate implementation.
 
 ## Wrapper subcommands
 
