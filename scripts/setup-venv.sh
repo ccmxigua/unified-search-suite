@@ -18,5 +18,9 @@ VENV_PY="$SKILL_DIR/.venv/bin/python"
 if [[ ! -x "$VENV_PY" ]]; then
   "$PYTHON_BIN" -m venv "$SKILL_DIR/.venv"
 fi
+if ! "$VENV_PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+  echo "[ERROR] Existing .venv requires Python 3.10 or newer; move it aside and rerun setup with a supported PYTHON_BIN" >&2
+  exit 1
+fi
 "$VENV_PY" -m pip install -r "$SKILL_DIR/requirements.txt"
 echo "[OK] Environment ready at $SKILL_DIR/.venv"

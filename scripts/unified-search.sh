@@ -65,6 +65,7 @@ has_arg() {
   shift || true
   local arg
   for arg in "$@"; do
+    [[ "$arg" == "--" ]] && break
     [[ "$arg" == "$needle" ]] && return 0
   done
   return 1
@@ -74,15 +75,25 @@ normalize_mode_aliases() {
   local explicit_mode=0
   local arg
   for arg in "$@"; do
-    if [[ "$arg" == "--mode" ]]; then
+    [[ "$arg" == "--" ]] && break
+    if [[ "$arg" == "--mode" || "$arg" == --mode=* ]]; then
       explicit_mode=1
       break
     fi
   done
 
   NORMALIZED_ARGS=()
+  local literal=false
   for arg in "$@"; do
+    if $literal; then
+      NORMALIZED_ARGS+=("$arg")
+      continue
+    fi
     case "$arg" in
+      --)
+        literal=true
+        NORMALIZED_ARGS+=("$arg")
+        ;;
       --deep)
         if [[ "$explicit_mode" == "0" ]]; then
           NORMALIZED_ARGS+=(--mode deep)
@@ -103,17 +114,6 @@ normalize_mode_aliases() {
         ;;
     esac
   done
-}
-
-first_url() {
-  local arg
-  for arg in "$@"; do
-    if [[ "$arg" =~ ^https?:// ]]; then
-      printf '%s\n' "$arg"
-      return 0
-    fi
-  done
-  return 1
 }
 
 lower() {
@@ -284,7 +284,7 @@ run_search_layer_auto() {
     run_with_save "$SEARCH_LAYER_WRAPPER" --queries "${variants[@]}" --intent "$intent" --mode deep --source exa,tavily,grok,tinyfish
     return
   fi
-  run_with_save "$SEARCH_LAYER_WRAPPER" "$query" --intent "$intent" --mode deep --source exa,tavily,grok,tinyfish
+  run_with_save "$SEARCH_LAYER_WRAPPER" --intent "$intent" --mode deep --source exa,tavily,grok,tinyfish -- "$query"
 }
 
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
@@ -304,10 +304,15 @@ set -- "${NORMALIZED_ARGS[@]}"
 SAVE_RUN_DIR=""
 FILTERED=()
 SKIP_SAVE=false
+LITERAL_ARGS=false
 for arg in "$@"; do
+  if $LITERAL_ARGS; then
+    FILTERED+=("$arg")
+    continue
+  fi
   if $SKIP_SAVE; then
-    if [[ -z "$arg" ]]; then
-      echo "[ERROR] --save-run requires a non-empty directory argument" >&2
+    if [[ -z "$arg" || "$arg" == -* ]]; then
+      echo "[ERROR] --save-run requires a directory argument (prefix option-like paths with ./)" >&2
       exit 2
     fi
     SAVE_RUN_DIR="$arg"
@@ -318,26 +323,16 @@ for arg in "$@"; do
     SKIP_SAVE=true
     continue
   fi
+  if [[ "$arg" == "--" ]]; then
+    LITERAL_ARGS=true
+  fi
   FILTERED+=("$arg")
 done
 if $SKIP_SAVE; then
   echo "[ERROR] --save-run requires a directory argument" >&2
   exit 2
 fi
-set -- "${FILTERED[@]}"
-
-# Reject unknown long options before automatic routing can silently discard
-# the option name and accidentally turn its value into part of the query.
-for arg in "$@"; do
-  [[ "$arg" == "--" ]] && break
-  case "$arg" in
-    --legacy|--json|--deep|--fast|--answer|--mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--topic|--days|--mode=*|--intent=*|--freshness=*|--queries=*|--source=*|--domain-boost=*|--num=*|--timeout=*|--topic=*|--days=*) ;;
-    --*)
-      echo "[ERROR] Unknown option: $arg (use -- before literal query text beginning with --)" >&2
-      exit 2
-      ;;
-  esac
-done
+set -- ${FILTERED[@]+"${FILTERED[@]}"}
 
 # Fallback to env var if --save-run not explicitly passed on command line
 if [[ -z "$SAVE_RUN_DIR" && -n "${UNIFIED_SEARCH_SAVE_DIR:-}" ]]; then
@@ -405,7 +400,7 @@ case "$cmd" in
     ;;
   legacy)
     shift
-    run_with_save "$LEGACY_SCRIPT" "${LEGACY_SAVE[@]}" "$@"
+    run_with_save "$LEGACY_SCRIPT" ${LEGACY_SAVE[@]+"${LEGACY_SAVE[@]}"} "$@"
     ;;
   *)
     ;;
@@ -419,9 +414,37 @@ if has_arg --topic "$@" || has_arg --days "$@" || has_arg --json "$@"; then
   force_legacy=1
 fi
 
+# A leading URL selects a content route; its native parser owns all remaining
+# options. URLs used as search option values must not change the route.
+url="${1:-}"
+if [[ "$url" =~ ^https?:// && "$force_legacy" == "0" ]]; then
+  if is_thread_url "$url"; then
+    run_with_save "$FETCH_THREAD_WRAPPER" "$@"
+  elif is_document_url "$url"; then
+    run_with_save "$MINERU_EXTRACT_WRAPPER" "$@"
+  else
+    run_with_save "$CONTENT_EXTRACT_WRAPPER" --url "$@"
+  fi
+fi
+
+# Explicit subcommands and URL routes validate their own options. This check
+# protects only automatic text routing from silently dropping unknown options.
+for arg in "$@"; do
+  [[ "$arg" == "--" ]] && break
+  case "$arg" in
+    --legacy|--json|--mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--topic|--days|--mode=*|--intent=*|--freshness=*|--queries=*|--source=*|--domain-boost=*|--num=*|--timeout=*|--topic=*|--days=*) ;;
+    --*)
+      echo "[ERROR] Unknown option: $arg (use -- before literal query text beginning with --)" >&2
+      exit 2
+      ;;
+  esac
+  case "$arg" in --topic=*|--days=*) force_legacy=1 ;; esac
+done
+
 if [[ "$force_legacy" == "0" ]]; then
   local_like_flags=0
   for arg in "$@"; do
+    [[ "$arg" == "--" ]] && break
     case "$arg" in
       --mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--mode=*|--intent=*|--freshness=*|--source=*|--num=*|--timeout=*|--domain-boost=*)
         local_like_flags=1
@@ -433,17 +456,6 @@ if [[ "$force_legacy" == "0" ]]; then
   fi
 fi
 
-url="$(first_url "$@" || true)"
-if [[ -n "$url" && "$force_legacy" == "0" ]]; then
-  if is_thread_url "$url"; then
-    run_with_save "$FETCH_THREAD_WRAPPER" "$url"
-  elif is_document_url "$url"; then
-    run_with_save "$MINERU_EXTRACT_WRAPPER" "$url"
-  else
-    run_with_save "$CONTENT_EXTRACT_WRAPPER" --url "$url"
-  fi
-fi
-
 query="$(query_text "$@")"
 if [[ -n "$query" && "$force_legacy" == "0" ]]; then
   # Default chat /unified_search behavior: route ordinary lookups to deep search-layer.
@@ -451,4 +463,4 @@ if [[ -n "$query" && "$force_legacy" == "0" ]]; then
   run_search_layer_auto "$query"
 fi
 
-run_with_save "$LEGACY_SCRIPT" "${LEGACY_SAVE[@]}" "$@"
+run_with_save "$LEGACY_SCRIPT" ${LEGACY_SAVE[@]+"${LEGACY_SAVE[@]}"} "$@"

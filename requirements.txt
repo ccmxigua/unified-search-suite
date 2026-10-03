@@ -1,5 +1,5 @@
 beautifulsoup4
 lxml
-mcp
+mcp>=1.12,<2
 requests
 trafilatura

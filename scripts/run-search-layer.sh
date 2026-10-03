@@ -19,15 +19,19 @@ fi
 
 [[ -f "$ENV_LOADER" ]] && source "$ENV_LOADER"
 
-# The search layer currently exits successfully with an empty result set when
-# no selected provider has credentials. Detect that case before starting it so
-# callers can distinguish "not configured" from a valid no-hit search.
+# Check credentials early while preserving the search layer's distinction
+# between "not configured" and a valid no-hit search.
 search_mode="deep"
 requested_sources=""
 has_query=false
 skip_value=""
 skip_ref_urls=false
 for arg in "$@"; do
+  if [[ "$arg" == "--" ]]; then
+    # All remaining arguments are literal query text, never provider options.
+    has_query=true
+    break
+  fi
   if [[ "$skip_ref_urls" == true ]]; then
     if [[ "$arg" == --* ]]; then
       skip_ref_urls=false

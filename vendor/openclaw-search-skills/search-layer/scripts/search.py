@@ -1481,7 +1481,7 @@ def main():
             "refs_status": {"total": len(refs), "failed": failed, "truncated": partial},
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
-        return
+        return 1 if output["status"] == "error" else 0
     else:
         ap.error("Provide a query positional argument, --queries, or --extract-refs-urls")
 
@@ -1570,9 +1570,10 @@ def main():
 
     # Score and sort if intent is specified
     if args.intent:
-        primary_query = queries[0]  # Use first query for keyword scoring
         for r in deduped:
-            r["score"] = score_result(r, primary_query, args.intent, boost_domains)
+            # A result relevant to any query should retain its keyword score,
+            # including translated variants and later comparison subqueries.
+            r["score"] = max(score_result(r, q, args.intent, boost_domains) for q in queries)
         deduped.sort(key=lambda x: x.get("score", 0), reverse=True)
 
     _populate_chinese_summaries(deduped)
@@ -1665,7 +1666,8 @@ def main():
             output["status"] = "partial"
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 1 if output["status"] == "error" else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

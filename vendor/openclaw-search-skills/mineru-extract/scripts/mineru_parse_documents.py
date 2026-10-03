@@ -39,12 +39,15 @@ import zipfile
 def _default_workspace() -> pathlib.Path:
     """Return workspace root, preferring env override."""
     if v := os.environ.get("OPENCLAW_WORKSPACE"):
-        return pathlib.Path(v)
+        return pathlib.Path(v).expanduser()
     return pathlib.Path.home() / ".openclaw" / "workspace"
 
 
-WORKSPACE = _default_workspace()
-CACHE_ROOT = WORKSPACE / "mineru-cache"
+def _cache_root() -> pathlib.Path:
+    # Resolve at use time, after main() has loaded the skill's .env files.
+    return _default_workspace() / "mineru-cache"
+
+
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_ZIP_MEMBERS = 5000
@@ -359,7 +362,7 @@ def parse_one_url(*, api_base: str, token: str, source_url: str, enable_ocr: boo
         payload["extra_formats"] = extra_formats
 
     key = _cache_key(payload)
-    out_dir = CACHE_ROOT / key
+    out_dir = _cache_root() / key
     meta_path = out_dir / "meta.json"
 
     if cache and (not force) and meta_path.exists():

@@ -1,0 +1,40 @@
+name: Regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.10'
+          - os: ubuntu-latest
+            python: '3.14'
+          - os: macos-latest
+            python: '3.14'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install runtime
+        run: bash scripts/setup-venv.sh
+        env:
+          PYTHON_BIN: python
+      - name: Check dependencies
+        run: .venv/bin/python -m pip check
+      - name: Offline regression suite
+        run: .venv/bin/python -m unittest discover -s tests -v
+      - name: Python and shell syntax
+        run: |
+          .venv/bin/python -m compileall -q mcp-server.py scripts vendor tests
+          for script in scripts/*.sh; do bash -n "$script"; done
+          git diff --check

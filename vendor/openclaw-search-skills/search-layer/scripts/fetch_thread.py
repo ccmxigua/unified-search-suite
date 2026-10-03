@@ -567,8 +567,9 @@ def _apply_web_fallback(result: dict, fallback: dict, reason: str) -> None:
         result["error"] = f"Platform API failed ({reason[:200]}); web fallback returned no content"
 
 
-def fetch_v2ex(url: str) -> dict:
+def fetch_v2ex(url: str, max_comments: int = 100) -> dict:
     """Fetch a V2EX topic via API and extract structured content."""
+    max_comments = max(1, min(MAX_COMMENTS, int(max_comments)))
     result = {
         "url": url,
         "type": "v2ex_topic",
@@ -616,19 +617,19 @@ def fetch_v2ex(url: str) -> dict:
                 raw_replies = replies_data["json"] or []
                 if not isinstance(raw_replies, list):
                     raw_replies = []
-                for r in raw_replies[:MAX_COMMENTS]:
+                for r in raw_replies[:max_comments]:
                     result["comments"].append({
                         "author": r.get("member", {}).get("username", ""),
                         "date": r.get("created", ""),
                         "body": r.get("content", ""),
                     })
-                if len(raw_replies) > MAX_COMMENTS:
+                if len(raw_replies) > max_comments:
                     _mark_truncated(result, "comments_limit_reached")
                 result["metadata"]["fetched_comment_count"] = len(result["comments"])
                 if result["metadata"].get("reply_count", 0) > len(result["comments"]):
                     reason = (
                         "comments_limit_reached"
-                        if len(result["comments"]) >= MAX_COMMENTS
+                        if len(result["comments"]) >= max_comments
                         else "reply_count_exceeds_fetched_count"
                     )
                     _mark_truncated(result, reason)
@@ -646,8 +647,9 @@ def fetch_v2ex(url: str) -> dict:
     return result
 
 
-def fetch_hn(url: str) -> dict:
+def fetch_hn(url: str, max_comments: int = 200) -> dict:
     """Fetch a Hacker News item via Algolia API (no auth required)."""
+    max_comments = max(1, min(200, int(max_comments)))
     result = {
         "url": url,
         "type": "hn_item",
@@ -694,7 +696,7 @@ def fetch_hn(url: str) -> dict:
         comment_budget = {"count": 0, "truncated": False}
 
         def _parse_hn_comment(node: dict, depth: int = 0) -> dict | None:
-            if comment_budget["count"] >= 200:
+            if comment_budget["count"] >= max_comments:
                 comment_budget["truncated"] = True
                 return None
             if not node.get("author"):
@@ -714,7 +716,7 @@ def fetch_hn(url: str) -> dict:
                 parsed = _parse_hn_comment(child, depth + 1)
                 if parsed:
                     children.append(parsed)
-                if comment_budget["count"] >= 200:
+                if comment_budget["count"] >= max_comments:
                     if index < len(child_nodes) - 1:
                         comment_budget["truncated"] = True
                     break
@@ -728,7 +730,7 @@ def fetch_hn(url: str) -> dict:
             parsed = _parse_hn_comment(node)
             if parsed:
                 result["comments_tree"].append(parsed)
-            if comment_budget["count"] >= 200:
+            if comment_budget["count"] >= max_comments:
                 if index < len(children) - 1:
                     comment_budget["truncated"] = True
                 break
@@ -1150,9 +1152,9 @@ def fetch_thread_url(url: str, max_comments: int = 100) -> dict:
         else:
             return fetch_web_page(url)
     elif platform == "v2ex":
-        return fetch_v2ex(url)
+        return fetch_v2ex(url, max_comments)
     elif platform == "hn":
-        return fetch_hn(url)
+        return fetch_hn(url, max_comments)
     elif platform == "reddit":
         return fetch_reddit(url, max_comments)
     else:

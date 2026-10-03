@@ -52,7 +52,7 @@ def unified_search(query: str) -> str:
 
     try:
         result = subprocess.run(
-            ["bash", UNIFIED_SEARCH_BIN, query],
+            ["bash", UNIFIED_SEARCH_BIN, "--", query],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -91,10 +91,14 @@ def unified_search(query: str) -> str:
                 re.I | re.M,
             )
         })
+        status = search_result.get("status") if isinstance(search_result, dict) else None
+        if status not in {"success", "empty", "partial", "error", "timeout"}:
+            status = "partial" if provider_errors else "success"
+        elif provider_errors and status in {"success", "empty"}:
+            status = "partial"
         return json.dumps({
-            # Generic stderr diagnostics do not prove that results are
-            # incomplete. Mark partial only for explicit provider failures.
-            "status": "partial" if provider_errors else "success",
+            # Preserve the search layer's status, including reference failures.
+            "status": status,
             "result": search_result,
             "diagnostics": result.stderr.strip(),
             "provider_errors": provider_errors,

@@ -93,10 +93,12 @@ bash scripts/unified-search.sh mineru-parse-documents --file-sources "https://ex
 
 - Search-layer requests have a 105-second default deadline. Set `UNIFIED_SEARCH_TIMEOUT_SECONDS` or pass `--timeout` to use a different positive budget; the MCP wrapper's outer timeout remains 120 seconds by default.
 - `fetch-thread` accepts only HTTP(S) URLs, blocks localhost and non-public literal IP addresses (including on redirects), caps API responses at 10 MiB and generic HTML at 5 MiB, and limits fetched comments to 500 (HN comment trees to 200). Its CLI `--timeout` sets one request deadline. Results include `truncated` and `truncation_reasons` when a known limit or incomplete page affects returned content. Hostname DNS answers are not pinned, so this is not a complete DNS-rebinding/SSRF boundary.
+- `--max-comments` is honored by GitHub issue/PR, Reddit, HN, and V2EX routes; the HN budget counts all nested replies, with a maximum of 200.
 - Search JSON reports source/query outcomes through `status`, `provider_status`, `provider_errors`, and optional `query_errors`. Reference extraction adds `refs_status`; an item-level fetch error or truncation changes the overall status to `partial` (or `error` when every explicit-URL extraction fails).
+- Search exits non-zero when its overall status is `error`; valid empty searches and partial results retain exit code 0. Multi-query intent scoring uses the best match across all queries, so later queries and translated variants are not penalized by the first query's wording.
 - The standalone relevance gate fails closed when the scorer is unavailable or returns malformed/incomplete scores; it emits a structured failure object and non-zero exit status in those cases.
 - MinerU downloads are capped at 100 MiB. ZIP extraction is bounded to 5,000 members, 128 MiB per member, 512 MiB expanded total, and a 500:1 compression ratio; unsafe paths and symlinks are rejected. Request deadlines also bound polling and network calls.
-- `content-extract --timeout` bounds the MinerU child process (default 600 seconds); the wrapper allows 15 seconds of process-cleanup margin.
+- The bundled `content-extract` route uses its local extractor: `--timeout` controls the HTTP request (default 30 seconds), and `--max-chars` controls the returned text. The vendored MinerU fallback wrapper is a separate implementation.
 
 ## Wrapper subcommands
 
@@ -107,6 +109,12 @@ bash scripts/unified-search.sh "<query>"
 ```
 
 Ordinary queries now default to search-layer deep mode. Use the explicit `search-layer` subcommand for search-layer options such as `--num`, `--mode`, and `--intent`. `--save-run DIR` applies to wrapper routes and uses a unique filename if multiple runs start in the same second. `--topic`, `--days`, and `--json` select the legacy interface, which currently returns a missing-implementation error because its script is absent.
+
+Explicit subcommands forward their native options unchanged. A leading URL selects the corresponding
+thread/document/content route and forwards remaining options, including `--timeout` and `--format`
+where supported. Use `search-layer "<URL>"` to search for a URL instead of fetching it. Use `--` before
+literal text that resembles a wrapper option or subcommand; the MCP tool always treats its query as
+literal search text while retaining automatic intent detection and query expansion.
 
 Chinese query expansion and optional English-to-Chinese result summaries use Google Translate by default. Set `UNIFIED_SEARCH_DISABLE_TRANSLATION=1` to keep both the query and result text local to the configured search providers.
 
@@ -197,6 +205,9 @@ bash scripts/setup-venv.sh
 ```
 
 The setup script requires Python 3.10 or newer. It installs the content extraction, search, and MCP server dependencies into `.venv`.
+
+MinerU document parsing resolves `OPENCLAW_WORKSPACE` after loading its skill `.env` files. An existing
+process environment value takes precedence. Its cache lives under `<workspace>/mineru-cache`.
 
 ## Important constraints
 
