@@ -88,6 +88,12 @@ class WrapperTests(unittest.TestCase):
         self.assert_route("search-layer", ["Python", "--source", "exa", "--num", "3"],
                           "Python", "--source", "exa", "--num", "3")
 
+    def test_filter_and_content_flags_reach_search(self):
+        args = ["Python", "--include-domains", "python.org", "--exclude-domains=pypi.org",
+                "--start-date", "2025-01-01", "--end-date=2025-12-31", "--read-top", "2",
+                "--content-max-chars=1000", "--content-timeout", "5", "--content-fallback=none"]
+        self.assert_route("search-layer", args, *args)
+
     def test_literal_query_is_not_consumed_as_wrapper_options(self):
         args = ["--", "--save-run", "somewhere", "--fast"]
         self.assert_route("search-layer", args, "search-layer", *args)
@@ -325,11 +331,20 @@ class MCPProtocolTests(unittest.IsolatedAsyncioTestCase):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
                             listed = await session.list_tools()
-                            self.assertEqual([tool.name for tool in listed.tools], ["unified_search"])
+                            self.assertEqual([tool.name for tool in listed.tools], ["unified_search", "extract_content", "fetch_thread"])
+                            self.assertIn("include_domains", listed.tools[0].inputSchema["properties"])
                             result = await session.call_tool("unified_search", {"query": "--save-run"})
                             self.assertFalse(result.isError)
                             self.assertEqual(json.loads(result.content[0].text),
                                              {"status": "success", "args": ["--", "--save-run"]})
+                            for name, arguments, route in [
+                                ("extract_content", {"url": "https://example.com", "fallback": "mineru"}, "content-extract"),
+                                ("fetch_thread", {"url": "https://news.ycombinator.com/item?id=1", "max_comments": 3}, "fetch-thread"),
+                                ("unified_search", {"query": "test", "include_domains": ["example.com"], "read_top": 1}, "search-layer"),
+                            ]:
+                                result = await session.call_tool(name, arguments)
+                                self.assertFalse(result.isError)
+                                self.assertEqual(json.loads(result.content[0].text)["args"][0], route)
 
         await asyncio.wait_for(exercise(), timeout=20)
 

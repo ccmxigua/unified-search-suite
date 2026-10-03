@@ -18,6 +18,15 @@ bash scripts/setup-venv.sh
 
 See [SKILL.md](./SKILL.md) for full documentation.
 
+Search can restrict domains and publication dates, then extract full text from the
+top results within a shared time budget. The MCP server exposes configurable search,
+standalone content extraction and discussion fetching. MinerU fallback is opt-in.
+
+```bash
+bash scripts/unified-search.sh search-layer "Python asyncio documentation" \
+  --include-domains python.org --source exa,tavily --intent factual --read-top 2
+```
+
 ## Tests
 
 After installing the runtime, run the offline regression suite:

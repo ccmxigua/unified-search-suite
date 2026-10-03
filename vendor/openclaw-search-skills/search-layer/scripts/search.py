@@ -36,6 +36,96 @@ from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 from pathlib import Path
 import threading
 import importlib.util
+import subprocess
+from email.utils import parsedate_to_datetime
+
+
+def build_filters(include_domains=None, exclude_domains=None, start_date=None, end_date=None):
+    """Normalize hard filters. Domains include subdomains; dates are inclusive UTC days."""
+    def domains(value):
+        result = []
+        for raw in (value or "").split(","):
+            if not raw.strip():
+                continue
+            host = raw.strip().rstrip(".").lower().encode("idna").decode("ascii")
+            if len(host) > 253 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host):
+                raise ValueError("Domains must be hostnames, without URLs, paths, ports or wildcards")
+            if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-") for label in host.split(".")):
+                raise ValueError("Invalid domain name")
+            if host not in result:
+                result.append(host)
+        if len(result) > 100:
+            raise ValueError("At most 100 domains are supported per filter")
+        return result
+
+    def day(value):
+        if value is None:
+            return None
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("Dates must use YYYY-MM-DD")
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        if not 1900 <= parsed.year <= 9998:
+            raise ValueError("Date year must be between 1900 and 9998")
+        return parsed.isoformat()
+
+    filters = {"include_domains": domains(include_domains), "exclude_domains": domains(exclude_domains),
+               "start_date": day(start_date), "end_date": day(end_date)}
+    if filters["start_date"] and filters["end_date"] and filters["start_date"] > filters["end_date"]:
+        raise ValueError("start_date must not be after end_date")
+    return filters if any(filters.values()) else None
+
+
+def _provider_filters(filters, provider):
+    if not filters:
+        return {}
+    out = {}
+    for key in ("include_domains", "exclude_domains"):
+        if filters[key]:
+            name = {"include_domains": "includeDomains", "exclude_domains": "excludeDomains"}[key] if provider == "exa" else key
+            out[name] = filters[key]
+    # Fetch a slightly wider window; local validation guarantees inclusive UTC
+    # dates even when providers interpret "before"/"after" differently.
+    for key, offset in (("start_date", -1), ("end_date", 1)):
+        if filters[key]:
+            day = datetime.strptime(filters[key], "%Y-%m-%d") + timedelta(days=offset)
+            name = {"start_date": "startPublishedDate", "end_date": "endPublishedDate"}[key] if provider == "exa" else key
+            out[name] = day.strftime("%Y-%m-%dT00:00:00.000Z" if provider == "exa" else "%Y-%m-%d")
+    if provider == "tavily" and (filters["start_date"] or filters["end_date"]):
+        out.update(include_published_date=True, filter_by_published_date=True)
+    return out
+
+
+def _filter_results(results, filters):
+    stats = {"removed": 0, "unknown_date": 0}
+    if not filters:
+        return results, stats
+    kept = []
+    for result in results:
+        try:
+            host = (urlparse(result.get("url", "")).hostname or "").rstrip(".").lower().encode("idna").decode("ascii")
+        except (ValueError, UnicodeError):
+            host = ""
+        def matches(domains):
+            return any(host == domain or host.endswith("." + domain) for domain in domains)
+        allowed = bool(host) and (not filters["include_domains"] or matches(filters["include_domains"])) and not matches(filters["exclude_domains"])
+        if allowed and (filters["start_date"] or filters["end_date"]):
+            raw = result.get("published_date")
+            try:
+                try:
+                    stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                except ValueError:
+                    stamp = parsedate_to_datetime(raw)
+                stamp = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
+                day = stamp.date().isoformat()
+                allowed = (not filters["start_date"] or day >= filters["start_date"]) and (not filters["end_date"] or day <= filters["end_date"])
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                stats["unknown_date"] += 1
+                allowed = False
+        if allowed:
+            kept.append(result)
+        else:
+            stats["removed"] += 1
+    return kept, stats
 
 _TRANSLATION_CACHE = {}
 _REQUEST_DEADLINE = None
@@ -877,7 +967,7 @@ def search_exa(query: str, key: str, num: int = 5,
                freshness: str | None = None,
                with_highlights: bool = True,
                with_summary: bool = True,
-               base_url: str | None = None) -> list:
+               base_url: str | None = None, filters: dict | None = None) -> list:
     """Exa search.
 
     base_url can be either:
@@ -894,6 +984,7 @@ def search_exa(query: str, key: str, num: int = 5,
         start_published_date = _exa_start_published_date(freshness)
         if start_published_date:
             payload["startPublishedDate"] = start_published_date
+        payload.update(_provider_filters(filters, "exa"))
         contents = _exa_contents_payload(
             query,
             with_highlights=with_highlights,
@@ -949,7 +1040,7 @@ def search_exa(query: str, key: str, num: int = 5,
 def search_tavily(query: str, key: str, num: int = 5,
                    include_answer: bool = False,
                    freshness: str = None,
-                   api_url: str | None = None) -> dict:
+                   api_url: str | None = None, filters: dict | None = None) -> dict:
     """Returns {"results": [...], "answer": str|None}."""
     try:
         payload = {
@@ -963,6 +1054,7 @@ def search_tavily(query: str, key: str, num: int = 5,
             days_map = {"pd": 1, "pw": 7, "pm": 30, "py": 365}
             if freshness in days_map:
                 payload["days"] = days_map[freshness]
+        payload.update(_provider_filters(filters, "tavily"))
         endpoint = (api_url or "https://api.tavily.com/search").rstrip("/")
         if not endpoint.endswith("/search"):
             endpoint = endpoint + "/search"
@@ -1219,7 +1311,7 @@ def execute_search(query: str, mode: str, keys: dict, num: int,
                    include_answer: bool = False,
                    freshness: str = None,
                    sources: set = None,
-                   intent: str | None = None) -> tuple:
+                   intent: str | None = None, filters: dict | None = None) -> tuple:
     """Execute search for a single query. Returns (results_list, answer_text).
     If sources is set, only run those sources (e.g. {'grok', 'exa', 'tavily'})."""
     all_results = []
@@ -1227,7 +1319,7 @@ def execute_search(query: str, mode: str, keys: dict, num: int,
 
     # Source filter helper
     def _want(name: str) -> bool:
-        return sources is None or name in sources
+        return (not filters or name in {"exa", "tavily"}) and (sources is None or name in sources)
 
     # Grok config
     grok_url = keys.get("grok_url")
@@ -1246,6 +1338,7 @@ def execute_search(query: str, mode: str, keys: dict, num: int,
                 exa_type=exa_type,
                 freshness=freshness,
                 base_url=keys.get("exa_url"),
+                filters=filters,
             )
         elif has_grok and _want("grok"):
             all_results = search_grok(query, grok_url, grok_key, grok_model, num, freshness)
@@ -1265,12 +1358,13 @@ def execute_search(query: str, mode: str, keys: dict, num: int,
                     exa_type=exa_type,
                     freshness=freshness,
                     base_url=keys.get("exa_url"),
+                    filters=filters,
                 )] = "exa"
             if "tavily" in keys and _want("tavily"):
                 futures[pool.submit(
                     search_tavily, query, keys["tavily"], num,
-                    include_answer=True, freshness=freshness,
-                    api_url=keys.get("tavily_url"))] = "tavily"
+                    include_answer=not filters, freshness=freshness,
+                    api_url=keys.get("tavily_url"), filters=filters)] = "tavily"
             if has_grok and _want("grok"):
                 futures[pool.submit(
                     search_grok, query, grok_url, grok_key, grok_model, num, freshness)] = "grok"
@@ -1299,8 +1393,8 @@ def execute_search(query: str, mode: str, keys: dict, num: int,
             print('{"warning": "Tavily API key not found"}', file=sys.stderr)
         else:
             tav = search_tavily(query, keys["tavily"], num,
-                                include_answer=True, freshness=freshness,
-                                api_url=keys.get("tavily_url"))
+                                include_answer=not filters, freshness=freshness,
+                                api_url=keys.get("tavily_url"), filters=filters)
             all_results = tav["results"]
             answer_text = tav.get("answer")
 
@@ -1421,6 +1515,38 @@ def verify_urls(results: list, timeout: int = 5, max_workers: int = 5) -> list:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _read_result_content(results, count, timeout, max_chars, fallback):
+    """Bound each extraction by both its own budget and the search deadline."""
+    target = Path(__file__).resolve().parents[4] / "scripts/local-content-extract.py"
+
+    def read_one(result):
+        try:
+            budget = _bounded_timeout(timeout)
+            proc = subprocess.run(
+                [sys.executable, str(target), "--url", result["url"], "--timeout", str(budget),
+                 "--max-chars", str(max_chars), "--fallback", fallback],
+                capture_output=True, text=True, timeout=budget,
+            )
+            content = json.loads(proc.stdout)
+            if not isinstance(content, dict) or "ok" not in content:
+                raise ValueError("Invalid content extraction response")
+            return content
+        except (subprocess.TimeoutExpired, TimeoutError):
+            return {"ok": False, "source_url": result["url"], "markdown": None, "error": "content_timeout"}
+        except Exception as exc:
+            return {"ok": False, "source_url": result["url"], "markdown": None, "error": str(exc)[:300]}
+
+    chosen = results[:count]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        contents = list(pool.map(read_one, chosen))
+    for result, content in zip(chosen, contents):
+        result["content"] = content
+    return {"requested": count, "attempted": len(chosen),
+            "succeeded": sum(bool(c.get("ok")) for c in contents),
+            "failed": sum(not c.get("ok") for c in contents),
+            "low_quality": sum(c.get("quality") == "low" for c in contents)}
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Multi-source search v2 (Exa + Tavily) with intent-aware scoring")
@@ -1440,6 +1566,14 @@ def main():
                     help="Freshness filter (pd=24h, pw=week, pm=month, py=year)")
     ap.add_argument("--domain-boost", default=None,
                     help="Comma-separated domains to boost in scoring")
+    ap.add_argument("--include-domains", help="Comma-separated allowed hostnames (including subdomains)")
+    ap.add_argument("--exclude-domains", help="Comma-separated excluded hostnames (including subdomains)")
+    ap.add_argument("--start-date", help="Inclusive publication date, YYYY-MM-DD (UTC)")
+    ap.add_argument("--end-date", help="Inclusive publication date, YYYY-MM-DD (UTC)")
+    ap.add_argument("--read-top", type=int, default=0, help="Read full text for the first 0-10 results")
+    ap.add_argument("--content-timeout", type=float, default=30, help="Per-page extraction budget in seconds")
+    ap.add_argument("--content-max-chars", type=int, default=12000, help="Maximum extracted characters per page")
+    ap.add_argument("--content-fallback", choices=["none", "mineru"], default="none", help="Opt-in external fallback for failed/short extraction")
     ap.add_argument("--source", default=None,
                     help="Comma-separated sources to use (exa,tavily,grok). Default: all available")
     ap.add_argument("--extract-refs", action="store_true",
@@ -1454,6 +1588,24 @@ def main():
     args = ap.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be a finite positive number")
+    if args.num < 1:
+        ap.error("--num must be positive")
+    if not 0 <= args.read_top <= 10 or not 1 <= args.content_max_chars <= 200000:
+        ap.error("--read-top must be 0-10 and --content-max-chars must be 1-200000")
+    if not math.isfinite(args.content_timeout) or args.content_timeout <= 0:
+        ap.error("--content-timeout must be a finite positive number")
+    try:
+        filters = build_filters(args.include_domains, args.exclude_domains, args.start_date, args.end_date)
+    except (ValueError, UnicodeError) as exc:
+        ap.error(str(exc))
+    if args.freshness and (args.start_date or args.end_date):
+        ap.error("Use either --freshness or explicit dates, not both")
+    if filters and args.extract_refs_urls:
+        ap.error("Hard search filters cannot be combined with --extract-refs-urls")
+    if args.read_top and not (args.query or args.queries):
+        ap.error("--read-top requires a search query")
+    if args.content_fallback != "none" and not args.read_top:
+        ap.error("--content-fallback requires --read-top")
     set_request_deadline(time.monotonic() + args.timeout)
     with _SOURCE_OUTCOMES_LOCK:
         _SOURCE_OUTCOMES.clear()
@@ -1503,6 +1655,9 @@ def main():
     if keys.get("tinyfish"):
         available.add("tinyfish")
     selected = available if source_filter is None else available & source_filter
+    excluded_sources = sorted(selected - {"exa", "tavily"}) if filters else []
+    if filters:
+        selected &= {"exa", "tavily"}
     if args.mode == "fast":
         active_sources = {"exa"} if "exa" in selected else ({"grok"} if "grok" in selected else set())
     elif args.mode == "answer":
@@ -1512,13 +1667,14 @@ def main():
     if not active_sources:
         print(json.dumps({
             "status": "error",
-            "error": {"code": "no_search_provider", "message": "No configured search provider is available for this mode/source filter."},
+            "error": {"code": "unsupported_search_filters" if excluded_sources else "no_search_provider",
+                      "message": "No configured search provider supports this mode/source/filter combination."},
             "mode": args.mode,
             "intent": args.intent,
             "queries": queries,
             "count": 0,
             "results": [],
-            "provider_status": {},
+            "provider_status": {name: "unsupported_filters" for name in excluded_sources},
         }, ensure_ascii=False, indent=2))
         raise SystemExit(2)
 
@@ -1534,7 +1690,7 @@ def main():
                 include_answer=(args.mode == "answer"),
                 freshness=args.freshness,
                 sources=source_filter,
-                intent=args.intent)
+                intent=args.intent, filters=filters)
             all_results = results
         except Exception as e:
             query_errors.append({"query": queries[0], "error": str(e)[:300]})
@@ -1547,7 +1703,7 @@ def main():
                 pool.submit(execute_search, q, args.mode, keys, args.num,
                             freshness=args.freshness,
                             sources=source_filter,
-                            intent=args.intent): q
+                            intent=args.intent, filters=filters): q
                 for q in queries
             }
             for fut in concurrent.futures.as_completed(futures):
@@ -1561,6 +1717,8 @@ def main():
                 if ans and not answer_text:
                     answer_text = ans
 
+    # Filter before dedup so an undated duplicate cannot hide a dated match.
+    all_results, filter_stats = _filter_results(all_results, filters)
     # Dedup
     deduped = dedup(all_results)
 
@@ -1576,6 +1734,12 @@ def main():
             r["score"] = max(score_result(r, q, args.intent, boost_domains) for q in queries)
         deduped.sort(key=lambda x: x.get("score", 0), reverse=True)
 
+    # Prioritize explicitly requested full text over optional translations and
+    # synthesis, which share the same overall deadline.
+    content_status = None
+    if args.read_top:
+        content_status = _read_result_content(
+            deduped, args.read_top, args.content_timeout, args.content_max_chars, args.content_fallback)
     _populate_chinese_summaries(deduped)
 
     # Build output
@@ -1615,9 +1779,14 @@ def main():
         output["status"] = "success"
     output["provider_status"] = provider_status
     output["provider_errors"] = provider_errors
+    if filters:
+        output["filters"] = filters
+        output["filter_status"] = {**filter_stats, "excluded_sources": excluded_sources,
+                                   "synthesis": "omitted_unverified_filter_scope"}
+        provider_status.update({name: "unsupported_filters" for name in excluded_sources})
     if query_errors:
         output["query_errors"] = query_errors
-    if answer_text:
+    if answer_text and not filters:
         output["answer"] = answer_text
         answer_zh = _translate_to_zh(answer_text, limit=500)
         if answer_zh:
@@ -1634,6 +1803,7 @@ def main():
     )
     if (
         research_profile == "research-light"
+        and not filters
         and "exa" in keys
         and (source_filter is None or "exa" in source_filter)
     ):
@@ -1648,6 +1818,11 @@ def main():
         )
         if research:
             output["research"] = research
+
+    if content_status is not None:
+        output["content_status"] = content_status
+        if output["status"] != "error" and (output["content_status"]["failed"] or output["content_status"]["low_quality"]):
+            output["status"] = "partial"
 
     # --extract-refs: extract references from result URLs or explicit URL list
     if args.extract_refs or args.extract_refs_urls:

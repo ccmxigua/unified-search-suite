@@ -53,7 +53,7 @@ for arg in "$@"; do
     --source) skip_value="source" ;;
     --source=*) requested_sources="${arg#*=}" ;;
     --extract-refs-urls) skip_ref_urls=true ;;
-    --num|--timeout|--intent|--freshness|--domain-boost) skip_value="other" ;;
+    --include-domains|--exclude-domains|--start-date|--end-date|--read-top|--content-timeout|--content-max-chars|--content-fallback|--num|--timeout|--intent|--freshness|--domain-boost) skip_value="other" ;;
     --queries) has_query=true ;;
     --*) ;;
     *) has_query=true ;;

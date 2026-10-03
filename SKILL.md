@@ -10,7 +10,7 @@ This skill is now a **two-layer search suite**:
 1. **Vendored deep-research stack** — now the default for ordinary `/unified_search <query>` calls
    - `search-layer`: Exa + Tavily + Grok multi-source search with intent-aware scoring
    - `fetch-thread`: deep thread / issue / PR / forum context extraction
-   - `content-extract`: local URL → Markdown extraction (MinerU is a separate explicit route)
+   - `content-extract`: local URL → Markdown extraction with opt-in MinerU fallback
    - `mineru-extract`: official MinerU parsing wrapper
 2. **Legacy merged search** — compatibility route via `--legacy` or the explicit `legacy` subcommand, provided `scripts/unified-search-legacy.sh` is installed
    - Engines: **Tavily + Exa + Google**
@@ -89,6 +89,73 @@ bash scripts/unified-search.sh mineru-extract "https://example.com/file.pdf"
 bash scripts/unified-search.sh mineru-parse-documents --file-sources "https://example.com/file.pdf"
 ```
 
+### F. Search within a source/date range and read the results
+
+```bash
+bash scripts/unified-search.sh search-layer "Python asyncio documentation" \
+  --source exa,tavily --include-domains python.org --exclude-domains discuss.python.org \
+  --intent factual --num 5 --read-top 2 --content-max-chars 6000 --timeout 90
+
+bash scripts/unified-search.sh search-layer "Python 3.13 release" \
+  --source exa,tavily --include-domains blog.python.org \
+  --start-date 2024-10-01 --end-date 2024-10-31
+
+bash scripts/unified-search.sh content-extract --url "https://example.com/paper.pdf" \
+  --fallback mineru --timeout 90 --max-chars 12000
+```
+
+`--include-domains` and `--exclude-domains` accept comma-separated hostnames (no URL,
+path, port or wildcard). Each includes its subdomains; exclusion wins. Date boundaries
+are inclusive UTC days and use provider-reported publication metadata. Unknown or
+unparseable dates are excluded and counted in `filter_status.unknown_date`. Do not
+combine explicit dates with `--freshness`. These filters apply to search result URLs
+and metadata, not to every outbound link mentioned inside fetched pages.
+
+Hard-filtered searches use Exa/Tavily native filters and validate every result locally
+before deduplication. Grok/TinyFish are skipped with `unsupported_filters` in
+`provider_status`; if no compatible provider remains, the request fails explicitly.
+Unverified provider answers and automatic research synthesis are omitted while hard
+filters are active, including in answer mode, so unfiltered synthesis cannot leak into
+the filtered response. Search results and their summaries remain available.
+
+`--read-top N` (0-10, default 0) attaches a `content` object to each of the first N
+results. `--content-timeout` (default 30 seconds) and `--content-max-chars` (default
+12000) bound each extraction. The entire request still shares `--timeout`; extraction
+runs before optional translation/synthesis. `content_status` reports attempted,
+succeeded, failed and low-quality counts; page failures preserve search results and
+mark the overall status partial. Setting `--content-fallback mineru` explicitly opts
+into the external MinerU API and requires `MINERU_TOKEN`. It does not increase the
+overall deadline, so allow enough time for parsing.
+
+The extractor tries Trafilatura, then BeautifulSoup for empty/short output. Fewer
+than 200 characters is marked `quality=low`; this length heuristic does not verify
+factual accuracy or article completeness. Optional MinerU fallback runs only after
+failed/short local extraction. Output retains `attempts`, `notes`, provenance and
+`truncated`; a failed fallback preserves any usable local text. HTML downloads are
+capped at 5 MiB and five redirects. Local hostnames, non-public literal IPs and
+embedded URL credentials are rejected on each hop; DNS rebinding protection is
+still outside this boundary.
+
+Standalone extraction also requires `--max-chars` in 1-200000; the former zero
+value for unlimited text is rejected to keep CLI, search and MCP output bounded.
+
+### G. MCP tools
+
+Start the stdio server with `.venv/bin/python mcp-server.py`. It exposes:
+
+- `unified_search(query, mode, source, num, intent, freshness, include_domains,
+  exclude_domains, start_date, end_date, read_top, content_max_chars,
+  content_timeout, content_fallback, timeout)`. All except query are optional;
+  domain filters are lists. Query-only calls retain automatic intent detection and
+  bilingual query expansion. Supplying search options uses the explicit search-layer
+  route; mode=auto then selects deep mode.
+- `extract_content(url, timeout=30, max_chars=20000, fallback="none")` for standalone
+  Markdown extraction, with the same opt-in MinerU policy.
+- `fetch_thread(url, max_comments=100, timeout=60)` for structured discussion data.
+
+All tools share the configured MCP outer timeout and preserve native errors and
+truncation. A requested longer timeout cannot exceed `UNIFIED_SEARCH_MCP_TIMEOUT_SECONDS`.
+
 ## Request and content limits
 
 - Search-layer requests have a 105-second default deadline. Set `UNIFIED_SEARCH_TIMEOUT_SECONDS` or pass `--timeout` to use a different positive budget; the MCP wrapper's outer timeout remains 120 seconds by default.
@@ -130,6 +197,9 @@ Important parameters:
 - `--freshness pd|pw|pm|py`
 - `--queries ...`
 - `--domain-boost github.com,stackoverflow.com`
+- `--include-domains python.org --exclude-domains discuss.python.org`
+- `--start-date YYYY-MM-DD --end-date YYYY-MM-DD`
+- `--read-top 2 --content-timeout 30 --content-max-chars 12000 --content-fallback none|mineru`
 - `--source exa,tavily,grok,tinyfish`
 - `--extract-refs`
 - `--extract-refs-urls`
@@ -215,7 +285,7 @@ process environment value takes precedence. Its cache lives under `<workspace>/m
 - The original upstream README also references **Brave via OpenClaw built-in `web_search`**, but shell scripts themselves cannot call agent-only tools. So in pure CLI mode, Brave is not auto-executed by the wrapper.
 - The current default query route is the vendored deep `search-layer`; there is no bundled Google-backed legacy implementation in this snapshot.
 - If no configured provider matches the selected mode/source filter, `search-layer` emits a JSON `no_search_provider` error and exits non-zero instead of returning an indistinguishable successful empty result.
-- `content-extract` performs local extraction with its Python dependencies; it does not currently fall back to MinerU. `mineru-*` routes require external accessibility and a valid `MINERU_TOKEN`.
+- `content-extract` defaults to local extraction. `--fallback mineru` explicitly enables external fallback; `mineru-*` routes also require external accessibility and a valid `MINERU_TOKEN`.
 - The MCP wrapper defaults to a 120-second timeout. Set `UNIFIED_SEARCH_MCP_TIMEOUT_SECONDS` to a positive number to change that limit; timeouts and non-zero exits return JSON containing status and captured output. Successful runs preserve stderr diagnostics separately; only explicit provider failures mark the result `partial`.
 
 ## Vendored source snapshot

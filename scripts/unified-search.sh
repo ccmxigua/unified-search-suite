@@ -47,6 +47,8 @@ Search-layer flags (use the search-layer subcommand for the full option set):
   --fast   (alias of --mode fast)
   --answer (alias of --mode answer)
   --mode --intent --freshness --queries --source --num --timeout --extract-refs --extract-refs-urls --domain-boost
+  --include-domains --exclude-domains --start-date --end-date
+  --read-top --content-timeout --content-max-chars --content-fallback
 
 Legacy compatibility options (require scripts/unified-search-legacy.sh, not bundled here):
   --topic general|news --days N --json --legacy
@@ -161,7 +163,7 @@ query_text() {
       continue
     fi
     case "$arg" in
-      --num|--timeout|--topic|--days|--mode|--intent|--freshness|--source|--domain-boost|--extract-refs-urls)
+      --include-domains|--exclude-domains|--start-date|--end-date|--read-top|--content-timeout|--content-max-chars|--content-fallback|--num|--timeout|--topic|--days|--mode|--intent|--freshness|--source|--domain-boost|--extract-refs-urls)
         skip_value=true
         continue
         ;;
@@ -432,7 +434,7 @@ fi
 for arg in "$@"; do
   [[ "$arg" == "--" ]] && break
   case "$arg" in
-    --legacy|--json|--mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--topic|--days|--mode=*|--intent=*|--freshness=*|--queries=*|--source=*|--domain-boost=*|--num=*|--timeout=*|--topic=*|--days=*) ;;
+    --include-domains|--exclude-domains|--start-date|--end-date|--read-top|--content-timeout|--content-max-chars|--content-fallback|--include-domains=*|--exclude-domains=*|--start-date=*|--end-date=*|--read-top=*|--content-timeout=*|--content-max-chars=*|--content-fallback=*|--legacy|--json|--mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--topic|--days|--mode=*|--intent=*|--freshness=*|--queries=*|--source=*|--domain-boost=*|--num=*|--timeout=*|--topic=*|--days=*) ;;
     --*)
       echo "[ERROR] Unknown option: $arg (use -- before literal query text beginning with --)" >&2
       exit 2
@@ -446,7 +448,7 @@ if [[ "$force_legacy" == "0" ]]; then
   for arg in "$@"; do
     [[ "$arg" == "--" ]] && break
     case "$arg" in
-      --mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--mode=*|--intent=*|--freshness=*|--source=*|--num=*|--timeout=*|--domain-boost=*)
+      --include-domains|--exclude-domains|--start-date|--end-date|--read-top|--content-timeout|--content-max-chars|--content-fallback|--include-domains=*|--exclude-domains=*|--start-date=*|--end-date=*|--read-top=*|--content-timeout=*|--content-max-chars=*|--content-fallback=*|--mode|--intent|--freshness|--queries|--source|--extract-refs|--extract-refs-urls|--domain-boost|--num|--timeout|--verify-urls|--mode=*|--intent=*|--freshness=*|--source=*|--num=*|--timeout=*|--domain-boost=*)
         local_like_flags=1
         ;;
     esac
